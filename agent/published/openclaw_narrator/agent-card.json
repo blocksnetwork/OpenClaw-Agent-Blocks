@@ -1,0 +1,65 @@
+{
+  "identity": {
+    "agentName": "openclaw_narrator",
+    "displayName": "OpenClaw Narrator",
+    "description": "Reads a short text aloud and returns the narration as an MP3 using the configured TTS provider.",
+    "version": "1.0.0",
+    "provider": {
+      "organization": "openclaw-foundation"
+    }
+  },
+  "capabilities": {
+    "taskKinds": ["request"]
+  },
+  "io": {
+    "inputs": [
+      {
+        "id": "request",
+        "description": "Text to read aloud (max 600 characters).",
+        "contentType": "application/json",
+        "required": true,
+        "example": {
+          "text": "The launch slipped a week because of a battery recall."
+        },
+        "schema": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "id": "narration",
+        "description": "Spoken narration of the input text.",
+        "contentType": "audio/mpeg",
+        "guaranteed": true
+      }
+    ]
+  },
+  "tags": [
+    {
+      "id": "text-to-speech",
+      "name": "Text to Speech",
+      "description": "Generate an MP3 narration from a short text."
+    }
+  ],
+  "extensions": {
+    "blocks": {
+      "billingMode": "free",
+      "pricePerTask": "0.000",
+      "listing": "public"
+    }
+  },
+  "runtime": {
+    "handler": "./handler.ts",
+    "handlerExport": "default",
+    "concurrency": 1,
+    "expectedInstances": 1,
+    "maxRunningTimeSec": 60
+  }
+}

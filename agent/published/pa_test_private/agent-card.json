@@ -1,0 +1,86 @@
+{
+  "identity": {
+    "agentName": "pa_test_private",
+    "displayName": "PA Findability Probe (private)",
+    "description": "Throwaway PRIVATE agent used only by the personal-assistant findability test (Phase PA-0). Self-contained: echoes input + the caller identity Blocks exposes. Not a product agent.",
+    "version": "1.0.0",
+    "provider": {
+      "organization": "openclaw-foundation"
+    }
+  },
+  "capabilities": {
+    "taskKinds": ["request", "pipe"]
+  },
+  "io": {
+    "inputs": [
+      {
+        "id": "request",
+        "description": "Any text; the probe echoes it back.",
+        "contentType": "application/json",
+        "required": true,
+        "example": { "text": "ping" },
+        "schema": {
+          "type": "object",
+          "required": ["text"],
+          "properties": { "text": { "type": "string" } }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "id": "reply",
+        "description": "Human-readable assistant response for the Blocks dashboard.",
+        "contentType": "text/markdown",
+        "guaranteed": true,
+        "example": "I checked your calendar and you're free tomorrow afternoon."
+      },
+      {
+        "id": "result",
+        "description": "Full structured assistant result JSON for programmatic callers.",
+        "contentType": "application/json",
+        "guaranteed": true,
+        "example": {
+          "ok": true,
+          "reply": "On it...",
+          "actions": [{ "kind": "answer-direct" }]
+        },
+        "schema": {
+          "type": "object",
+          "required": ["ok"],
+          "properties": {
+            "ok": { "type": "boolean" }
+          }
+        }
+      },
+      {
+        "id": "actions",
+        "description": "Planned assistant actions when the request uses tools, integrations, or peer agents.",
+        "contentType": "application/json",
+        "guaranteed": false,
+        "example": [{ "kind": "use-integration", "tool": "calendar.freeBusy", "args": { "query": "tomorrow afternoon" } }],
+        "schema": { "type": "array" }
+      }
+    ]
+  },
+  "tags": [
+    {
+      "id": "pa-findability-probe",
+      "name": "PA Findability Probe",
+      "description": "Private probe used by the personal-assistant findability test. Should NOT appear in public discovery."
+    }
+  ],
+  "extensions": {
+    "blocks": {
+      "billingMode": "free",
+      "pricePerTask": "0.000",
+      "listing": "private"
+    }
+  },
+  "runtime": {
+    "handler": "./handler.ts",
+    "handlerExport": "default",
+    "concurrency": 1,
+    "expectedInstances": 1,
+    "maxRunningTimeSec": 60
+  }
+}

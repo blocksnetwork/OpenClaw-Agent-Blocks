@@ -1,0 +1,14 @@
+# Drop-in template for the openclaw-bridge systemd unit.
+# Install with `sudo systemctl edit openclaw-bridge`, then copy these
+# Environment= lines into the override. The real Google OAuth credential
+# and token files are copied separately by the operator; do not paste
+# secret values into this drop-in.
+
+[Service]
+Environment=FOUNDATION_OFFLINE=0
+Environment=PERSONAL_ASSISTANTS_ENABLED=1
+Environment=BRIDGE_PUBLIC_BASE_URL=https://<your-bridge-host>
+Environment=PA_CALENDAR_MCP_CMD=npx
+Environment=PA_CALENDAR_MCP_ARGS="-y @cocal/google-calendar-mcp"
+Environment=GOOGLE_OAUTH_CREDENTIALS=/home/ubuntu/openclaw-foundation/data/secrets/gcp-oauth.keys.json
+Environment=GOOGLE_CALENDAR_MCP_TOKEN_PATH=/home/ubuntu/openclaw-foundation/data/config/gcal-token.json

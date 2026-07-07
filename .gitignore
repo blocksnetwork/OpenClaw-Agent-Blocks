@@ -1,0 +1,98 @@
+# =====================================================================
+# openclaw-foundation .gitignore
+# Built for a PUBLIC repo: nothing secret, personal, or machine-local
+# should ever be tracked. Commit only source and *.example files unless a
+# path is deliberately unignored below.
+# =====================================================================
+
+# --- secrets / env (NEVER commit) ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cert
+*credentials*.json
+*secret*.json
+data/secrets/
+
+# --- platform runtime state (machine-local, generated) ---
+data/*
+!data/.gitkeep
+
+# --- local docs / operator notes ---
+# Keep demo scripts, activation notes, and scratch runbooks out of GitHub.
+docs/
+
+# personal-assistant rosters (peer relationships — may contain private data)
+agent/data/assistants/*
+!agent/data/assistants/.gitkeep
+
+# personal-assistant A2A daily-call budget (machine-local runtime state)
+agent/data/a2a-budget.json
+
+# personal-assistant A2A hop audit trail (machine-local runtime state)
+agent/data/a2a-audit.jsonl
+
+# personal-assistant write-action audit / idempotency trail
+agent/data/booking-audit.jsonl
+
+# personal-assistant per-owner integration tokens (private runtime state)
+agent/data/integrations/*
+!agent/data/integrations/.gitkeep
+
+# personal-assistant per-owner identity profiles (private runtime state)
+agent/data/profiles/*
+!agent/data/profiles/.gitkeep
+
+# personal-assistant per-owner contact books (may contain personal data)
+agent/data/contacts/*
+!agent/data/contacts/.gitkeep
+
+# --- throwaway demo agent (publish walkthrough — keep out of the public repo) ---
+agent/published/pa_demo_private/
+temp/
+
+# --- node ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+.npm/
+
+# --- build / generated artifacts ---
+dist/
+build/
+coverage/
+outputs/
+*.local
+
+# --- agent persona / personal workspace files (may contain private data) ---
+workspace/.openclaw/
+workspace/HEARTBEAT.md
+workspace/IDENTITY.md
+workspace/SOUL.md
+workspace/TOOLS.md
+workspace/USER.md
+
+# --- logs ---
+*.log
+logs/
+
+# --- os / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.tmp
+
+# AI-only dev tool (references private docs/CODEX-TASKS.md) — keep local, not public
+scripts/codex-backlog.mjs
+
+# personal-assistant per-tenant runtime state (private)
+agent/data/pa-tenants/

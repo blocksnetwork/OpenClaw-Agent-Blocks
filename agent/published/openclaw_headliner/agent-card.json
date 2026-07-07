@@ -1,0 +1,89 @@
+{
+  "identity": {
+    "agentName": "openclaw_headliner",
+    "displayName": "OpenClaw Headliner",
+    "description": "Turns long-form text into a single ≤8-word headline through the local OpenClaw headline-writer skill.",
+    "version": "1.0.0",
+    "provider": {
+      "organization": "openclaw-foundation"
+    }
+  },
+  "capabilities": {
+    "taskKinds": ["request"]
+  },
+  "io": {
+    "inputs": [
+      {
+        "id": "request",
+        "description": "Source text to write a headline for.",
+        "contentType": "application/json",
+        "required": true,
+        "example": {
+          "text": "Quarterly revenue grew 18 percent on the strength of the new subscription tier, but churn in the legacy product doubled."
+        },
+        "schema": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "id": "result",
+        "description": "Headline-writer result from OpenClaw.",
+        "contentType": "application/json",
+        "guaranteed": true,
+        "example": {
+          "ok": true,
+          "headline": "Subscription Tier Lifts Revenue As Legacy Churn Doubles",
+          "wordCount": 8
+        },
+        "schema": {
+          "type": "object",
+          "required": ["ok", "headline", "wordCount"],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": true
+            },
+            "headline": {
+              "type": "string"
+            },
+            "wordCount": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "tags": [
+    {
+      "id": "openclaw-headline-write",
+      "name": "OpenClaw Headline Write",
+      "description": "Write an ≤8-word headline for a block of text through an OpenClaw skill."
+    }
+  ],
+  "extensions": {
+    "blocks": {
+      "billingMode": "free",
+      "pricePerTask": "0.000",
+      "listing": "public"
+    },
+    "openclawFoundation": {
+      "skill": "headline_writer"
+    }
+  },
+  "runtime": {
+    "handler": "./handler.ts",
+    "handlerExport": "default",
+    "concurrency": 1,
+    "expectedInstances": 1,
+    "maxRunningTimeSec": 120
+  }
+}

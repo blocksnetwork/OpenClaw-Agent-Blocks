@@ -1,0 +1,19 @@
+# gitleaks config for openclaw-foundation.
+# Extends the built-in ruleset and allowlists the documented placeholders
+# in *.example files so they don't trip the scanner.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore documented examples and lockfiles"
+paths = [
+  '''\.env\.example$''',
+  '''(^|/)package-lock\.json$''',
+]
+regexes = [
+  # Placeholder values used in docs / examples.
+  '''sk-proj-XXXX''',
+  '''your[-_]?api[-_]?key''',
+  '''<your-[a-z-]+>''',
+]

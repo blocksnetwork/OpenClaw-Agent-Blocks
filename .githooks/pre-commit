@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# Local secret-scan guard. Enable once with:
+#   git config core.hooksPath .githooks
+#
+# Blocks a commit when a staged file looks like it carries a secret or is
+# an environment file that must never be committed.
+
+set -euo pipefail
+
+fail() {
+  echo "✋ pre-commit blocked: $1" >&2
+  echo "   (override with 'git commit --no-verify' only if you are certain)" >&2
+  exit 1
+}
+
+# Staged files (added/copied/modified), excluding deletions.
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+[ -z "$staged" ] && exit 0
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+
+  # 1. Never commit real env files (allow *.example).
+  case "$file" in
+    .env|.env.*)
+      case "$file" in
+        *.example) : ;;
+        *) fail "attempting to commit env file '$file'" ;;
+      esac
+      ;;
+  esac
+
+  # 2. Scan added lines for obvious key shapes.
+  added=$(git diff --cached -U0 -- "$file" | grep '^+' | grep -v '^+++' || true)
+  [ -z "$added" ] && continue
+
+  if printf '%s' "$added" | grep -Eq 'sk-(proj-)?[A-Za-z0-9_-]{20,}'; then
+    fail "possible OpenAI API key in '$file'"
+  fi
+  if printf '%s' "$added" | grep -Eq 'AKIA[0-9A-Z]{16}'; then
+    fail "possible AWS access key in '$file'"
+  fi
+  if printf '%s' "$added" | grep -Eq -- '-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+    fail "possible private key in '$file'"
+  fi
+done <<< "$staged"
+
+exit 0

@@ -1,0 +1,83 @@
+{
+  "identity": {
+    "agentName": "openclaw_image_describer",
+    "displayName": "OpenClaw Image Describer",
+    "description": "Understands an uploaded image (base64) and returns a text description using the configured vision provider. Lets OpenClaw process a picture as part of a task by finding a model that can read it.",
+    "version": "1.0.0",
+    "provider": {
+      "organization": "openclaw-foundation"
+    }
+  },
+  "capabilities": {
+    "taskKinds": ["request"]
+  },
+  "io": {
+    "inputs": [
+      {
+        "id": "request",
+        "description": "Base64-encoded image, its container format (png, jpg, jpeg, webp, gif), and an optional prompt to focus the description.",
+        "contentType": "application/json",
+        "required": true,
+        "example": {
+          "image": "<base64-encoded image bytes>",
+          "format": "png",
+          "prompt": "What's in this image? Suggest a caption."
+        },
+        "schema": {
+          "type": "object",
+          "required": ["image"],
+          "properties": {
+            "image": {
+              "type": "string"
+            },
+            "format": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "id": "description",
+        "description": "JSON { ok, text } with the model's description of the image.",
+        "contentType": "application/json",
+        "guaranteed": true
+      }
+    ]
+  },
+  "tags": [
+    {
+      "id": "image-to-text",
+      "name": "Image to Text",
+      "description": "Understand an image and return a text description."
+    },
+    {
+      "id": "image-understanding",
+      "name": "Image Understanding",
+      "description": "Analyze the contents of an image."
+    },
+    {
+      "id": "vision",
+      "name": "Vision",
+      "description": "Read and reason about images."
+    }
+  ],
+  "extensions": {
+    "blocks": {
+      "billingMode": "free",
+      "pricePerTask": "0.000",
+      "listing": "public"
+    }
+  },
+  "runtime": {
+    "handler": "./handler.ts",
+    "handlerExport": "default",
+    "concurrency": 1,
+    "expectedInstances": 1,
+    "maxRunningTimeSec": 90
+  }
+}

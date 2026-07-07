@@ -1,0 +1,106 @@
+# OpenClaw foundation — platform compose file.
+#
+# Runs only the shared OpenClaw services. Everything OpenClaw reads or
+# writes stays under this folder (./data, ./workspace). Nothing is
+# installed on the host; "uninstall" is `docker compose down -v` + a
+# folder delete.
+#
+#   docker compose up -d openclaw-gateway            # bring up the gateway
+#   docker compose --profile cli run --rm openclaw-cli --help
+#
+# See README.md for hardening notes.
+
+services:
+  openclaw-gateway:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    init: true
+
+    # --dev: create a dev config + workspace if missing (the image refuses
+    # to start otherwise on first run). --auth token + --token tells it to
+    # require the shared OPENCLAW_GATEWAY_TOKEN from .env.
+    command:
+      - node
+      - openclaw.mjs
+      - gateway
+      - run
+      - --dev
+      - --bind
+      - lan
+      - --auth
+      - token
+
+    # Loopback-only publication. Reachable at http://127.0.0.1:18789
+    # from this machine; nothing on the LAN can reach it.
+    ports:
+      - "127.0.0.1:18789:18789"
+
+    # --- Hardening ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # If the gateway refuses to start with all caps dropped, the minimum
+    # OpenClaw documents is dropping only NET_RAW and NET_ADMIN. Swap the
+    # `- ALL` above for those two in that case.
+
+    # --- Resource limits ---
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+
+    # --- Bind mounts (the only host paths visible to the container) ---
+    volumes:
+      - ./data/config:/home/node/.openclaw
+      - ./data/secrets:/home/node/.config/openclaw
+      - ./workspace:/home/node/.openclaw/workspace
+
+    env_file:
+      - .env
+
+    environment:
+      OPENCLAW_GATEWAY_BIND: lan
+      OPENCLAW_DISABLE_BONJOUR: 1
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18789/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    networks:
+      - openclaw_internal
+
+  # Optional CLI sidecar. Only starts with `--profile cli`. Shares the
+  # gateway's network namespace so it can reach 127.0.0.1:18789 inside
+  # the container.
+  openclaw-cli:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw-cli
+    profiles: ["cli"]
+    network_mode: "service:openclaw-gateway"
+    depends_on:
+      - openclaw-gateway
+    entrypoint: ["openclaw-cli"]
+    command: ["--help"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./data/config:/home/node/.openclaw
+      - ./data/secrets:/home/node/.config/openclaw
+      - ./workspace:/home/node/.openclaw/workspace
+    env_file:
+      - .env
+
+networks:
+  openclaw_internal:
+    name: openclaw_internal
+    driver: bridge

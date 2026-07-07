@@ -1,0 +1,85 @@
+{
+  "identity": {
+    "agentName": "openclaw_echo_normalizer",
+    "displayName": "OpenClaw Echo Normalizer",
+    "description": "Normalizes text through the local OpenClaw echo-check skill and returns JSON.",
+    "version": "1.0.0",
+    "provider": {
+      "organization": "openclaw-foundation"
+    }
+  },
+  "capabilities": {
+    "taskKinds": ["request"]
+  },
+  "io": {
+    "inputs": [
+      {
+        "id": "request",
+        "description": "Text to trim and lowercase.",
+        "contentType": "application/json",
+        "required": true,
+        "example": {
+          "text": "  Hello WORLD "
+        },
+        "schema": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "id": "result",
+        "description": "Echo-check result from OpenClaw.",
+        "contentType": "application/json",
+        "guaranteed": true,
+        "example": {
+          "ok": true,
+          "normalized": "hello world"
+        },
+        "schema": {
+          "type": "object",
+          "required": ["ok", "normalized"],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": true
+            },
+            "normalized": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "tags": [
+    {
+      "id": "openclaw-echo-normalize",
+      "name": "OpenClaw Echo Normalize",
+      "description": "Trim and lowercase text through an OpenClaw skill."
+    }
+  ],
+  "extensions": {
+    "blocks": {
+      "billingMode": "free",
+      "pricePerTask": "0.000",
+      "listing": "public"
+    },
+    "openclawFoundation": {
+      "skill": "echo_check"
+    }
+  },
+  "runtime": {
+    "handler": "./handler.ts",
+    "handlerExport": "default",
+    "concurrency": 1,
+    "expectedInstances": 1,
+    "maxRunningTimeSec": 120
+  }
+}

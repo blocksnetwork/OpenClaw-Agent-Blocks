@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>OpenClaw — Multimodal Chat</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Deployment config (backend baseUrl). A plain script so it runs before
+       the Babel-transpiled app reads window.OPENCLAW_CONFIG. -->
+  <script src="/config.js"></script>
+
+  <!-- React + Babel, self-hosted (no CDN, works offline). Root-relative
+       paths so the app loads from the base path. -->
+  <script src="/vendor/react.production.min.js"></script>
+  <script src="/vendor/react-dom.production.min.js"></script>
+  <script src="/vendor/babel.min.js"></script>
+
+  <!-- App source — transpiled in-browser by Babel. Load order matters:
+       lib defines window helpers the components depend on. -->
+  <script type="text/babel" src="/js/lib.jsx"></script>
+  <script type="text/babel" src="/js/markdown.jsx"></script>
+  <script type="text/babel" src="/js/components.jsx"></script>
+  <script type="text/babel" src="/js/composer.jsx"></script>
+  <script type="text/babel" src="/js/app.jsx"></script>
+</body>
+</html>

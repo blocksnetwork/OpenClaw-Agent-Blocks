@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    name: typecheck + tests + offline smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        env:
+          FOUNDATION_OFFLINE: "1"
+        run: npm test
+
+      - name: Offline smoke
+        env:
+          FOUNDATION_OFFLINE: "1"
+        run: npm run smoke
+
+      - name: Gated live PA smoke
+        env:
+          PA_LIVE_SMOKE: ${{ secrets.PA_LIVE_SMOKE }}
+          PA_LIVE_SMOKE_OWNER_ID: ${{ secrets.PA_LIVE_SMOKE_OWNER_ID }}
+          PA_LIVE_SMOKE_PEER_HANDLE: ${{ secrets.PA_LIVE_SMOKE_PEER_HANDLE }}
+          PA_LIVE_SMOKE_SELF_HANDLE: ${{ secrets.PA_LIVE_SMOKE_SELF_HANDLE }}
+          PA_LIVE_SMOKE_PEER_NAME: ${{ secrets.PA_LIVE_SMOKE_PEER_NAME }}
+          OPENCLAW_GATEWAY_URL: ${{ secrets.OPENCLAW_GATEWAY_URL }}
+          OPENCLAW_GATEWAY_TOKEN: ${{ secrets.OPENCLAW_GATEWAY_TOKEN }}
+          BLOCKS_API_KEY: ${{ secrets.BLOCKS_API_KEY }}
+          BLOCKS_BACKEND_URL: ${{ secrets.BLOCKS_BACKEND_URL }}
+          BLOCKS_CDM_URL: ${{ secrets.BLOCKS_CDM_URL }}
+        run: npm run check:pa-live-smoke
+
+  secret-scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

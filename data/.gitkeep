@@ -1,0 +1,2 @@
+# Keep this directory in the repo. All real contents (config/, secrets/,
+# blocks state, logs) are runtime-only and gitignored.

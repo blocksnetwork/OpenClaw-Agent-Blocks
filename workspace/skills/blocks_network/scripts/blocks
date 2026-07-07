@@ -1,0 +1,132 @@
+#!/bin/sh
+# blocks — CLI entrypoint for the blocks-network skill.
+# Talks to the local foundation bridge (the dashboard API on the host).
+#
+# Text-task commands take plain arguments and build the JSON themselves,
+# so callers never have to fight shell quoting. For non-text inputs use
+# the *-json variants, which read a JSON body from stdin.
+set -eu
+
+BASE="${BLOCKS_BRIDGE_URL:-http://host.docker.internal:18888}"
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+# All arguments are positional. Models sometimes invent flags like
+# --tag or --json; drop anything that starts with "--" so the real
+# positional arguments still land where they belong.
+i=0
+n=$#
+while [ "$i" -lt "$n" ]; do
+  a="$1"
+  shift
+  case "$a" in
+    --*) ;;
+    *) set -- "$@" "$a" ;;
+  esac
+  i=$((i + 1))
+done
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+url_encode() {
+  node -e 'process.stdout.write(encodeURIComponent(process.argv.slice(1).join(" ")))' "$@"
+}
+
+post() {
+  curl -s -m 150 -X POST "$BASE$1" -H 'content-type: application/json' -d "$2"
+}
+
+case "$cmd" in
+  status)
+    curl -sf -m 15 "$BASE/api/status"
+    ;;
+  discover)
+    tag="${1:?usage: blocks discover <skill-tag>}"
+    curl -sf -m 30 "$BASE/api/blocks?tag=$tag"
+    ;;
+  search)
+    query="${*:?usage: blocks search <catalog-query...>}"
+    encoded="$(url_encode "$query")"
+    curl -sf -m 30 "$BASE/api/blocks?q=$encoded&limit=100"
+    ;;
+  call)
+    handle="${1:?usage: blocks call <handle> <skill-tag> <text...>}"
+    tag="${2:?usage: blocks call <handle> <skill-tag> <text...>}"
+    shift 2
+    text="$(json_escape "$*")"
+    post /api/call-agent "{\"handle\":\"$handle\",\"skill\":\"$tag\",\"inputs\":{\"text\":\"$text\"}}"
+    ;;
+  fanout)
+    tag="${1:?usage: blocks fanout <skill-tag> <text...>}"
+    shift
+    text="$(json_escape "$*")"
+    # tries:2 — flaky agents get one retry with backoff before failing
+    post /api/fanout "{\"skill\":\"$tag\",\"inputs\":{\"text\":\"$text\"},\"limit\":10,\"tries\":2}"
+    ;;
+  race)
+    tag="${1:?usage: blocks race <skill-tag> <text...>}"
+    shift
+    text="$(json_escape "$*")"
+    post /api/fanout "{\"skill\":\"$tag\",\"inputs\":{\"text\":\"$text\"},\"limit\":10,\"tries\":2,\"mode\":\"race\"}"
+    ;;
+  best)
+    tag="${1:?usage: blocks best <skill-tag> <text...>}"
+    shift
+    text="$(json_escape "$*")"
+    post /api/fanout "{\"skill\":\"$tag\",\"inputs\":{\"text\":\"$text\"},\"limit\":10,\"tries\":2,\"mode\":\"best\"}"
+    ;;
+  describe)
+    # Understand an uploaded image: base64-encode a local image file and
+    # hire a vision (image-to-text) agent on Blocks. Trailing args are an
+    # optional prompt to focus the description.
+    img="${1:?usage: blocks describe <image-file> [prompt...]}"
+    shift
+    [ -f "$img" ] || { echo "{\"ok\":false,\"error\":\"no such image file: $img\"}" >&2; exit 1; }
+    b64="$(base64 < "$img" | tr -d '\n')"
+    ext="${img##*.}"
+    prompt="$(json_escape "$*")"
+    post /api/describe-image "{\"image\":\"$b64\",\"format\":\"$ext\",\"prompt\":\"$prompt\"}"
+    ;;
+  describe-json)
+    # echo '{"image":"<base64>","format":"png","prompt":"..."}' | blocks describe-json
+    post /api/describe-image "$(cat)"
+    ;;
+  call-json)
+    # echo '{"handle":"...","skill":"...","inputs":{...}}' | blocks call-json
+    post /api/call-agent "$(cat)"
+    ;;
+  fanout-json)
+    post /api/fanout "$(cat)"
+    ;;
+  served)
+    curl -sf -m 15 "$BASE/api/served"
+    ;;
+  serve)
+    dir="${1:?usage: blocks serve <published-folder>}"
+    post /api/serve "{\"dir\":\"$dir\"}"
+    ;;
+  stop)
+    name="${1:?usage: blocks stop <agentName>}"
+    post /api/stop "{\"agentName\":\"$name\"}"
+    ;;
+  assistant.invite)
+    # Record a mutual peer invite in both rosters (app-level handle
+    # exchange). Run `blocks invite send/accept` separately for the
+    # network membership.
+    self="${1:?usage: blocks assistant.invite <self-agent> <self-owner> <peer-agent> <peer-owner>}"
+    selfOwner="${2:?usage: blocks assistant.invite <self-agent> <self-owner> <peer-agent> <peer-owner>}"
+    peer="${3:?usage: blocks assistant.invite <self-agent> <self-owner> <peer-agent> <peer-owner>}"
+    peerOwner="${4:?usage: blocks assistant.invite <self-agent> <self-owner> <peer-agent> <peer-owner>}"
+    post /api/assistant/invite "{\"agentName\":\"$self\",\"owner\":\"$(json_escape "$selfOwner")\",\"peerAgentName\":\"$peer\",\"peerOwner\":\"$(json_escape "$peerOwner")\"}"
+    ;;
+  assistant.peers)
+    name="${1:?usage: blocks assistant.peers <agentName>}"
+    curl -sf -m 30 "$BASE/api/assistant/peers?agentName=$name"
+    ;;
+  *)
+    echo "usage: blocks status | discover <tag> | search <catalog-query...> | call <handle> <tag> <text...> | fanout <tag> <text...> | race <tag> <text...> | best <tag> <text...> | describe <image-file> [prompt...] | describe-json | call-json | fanout-json | served | serve <dir> | stop <agentName> | assistant.invite <self-agent> <self-owner> <peer-agent> <peer-owner> | assistant.peers <agentName>" >&2
+    exit 2
+    ;;
+esac
