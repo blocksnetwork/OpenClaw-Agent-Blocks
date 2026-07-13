@@ -1474,8 +1474,20 @@ function dashboardMultiTenantOpts(): MultiTenantAssistantOpts {
       // runtime hands each notification already scoped to its recipient
       // (`toOwnerId`) and share-policy filtered; this just fans it out.
       onOwnerNotify: (notification) => pushOwnerNotification(notification),
+      // A two-sided handshake spans two humans (and two tabs), so the default
+      // 15-min hold TTL is too short — a request can expire mid-conversation.
+      // Give it a demo-friendly default and let operators tune it.
+      meetingHoldTtlMs: dashboardMeetingHoldTtlMs(),
     },
   };
+}
+
+/** Hold/request TTL for the two-sided meeting handshake. Defaults to 24h so a
+ *  live demo never expires mid-conversation; override with PA_MEETING_HOLD_TTL_MS
+ *  (milliseconds). Falls back to the default when unset or not a positive int. */
+function dashboardMeetingHoldTtlMs(): number {
+  const raw = Number(process.env.PA_MEETING_HOLD_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 24 * 60 * 60_000;
 }
 
 interface StandingAssistantBindings {

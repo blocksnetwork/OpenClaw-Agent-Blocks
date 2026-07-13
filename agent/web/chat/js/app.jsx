@@ -213,6 +213,15 @@
     if (!nextOwnerId || prevOwnerId === nextOwnerId) return false;
     if (!prevOwnerId || isStaleDemoOwnerId(prevOwnerId)) return true;
 
+    // A per-owner subdomain (source "assistant-host") binds THIS page to exactly
+    // one owner. That binding is authoritative: adopt it even when the saved id
+    // is another KNOWN owner. Otherwise a stale localStorage owner — e.g. from
+    // testing the other assistant in the same browser — hijacks every
+    // owner-scoped call (notifications, accept), so the peer sees the initiator's
+    // "Waiting for … to accept" card and can never accept a meeting as
+    // themselves. The host binding must win over any previously saved owner.
+    if (String(identity && identity.source || "") === "assistant-host") return true;
+
     const knownOwners = identity && Array.isArray(identity.ownerIds)
       ? identity.ownerIds.map((id) => String(id || "").trim()).filter(Boolean)
       : [];
