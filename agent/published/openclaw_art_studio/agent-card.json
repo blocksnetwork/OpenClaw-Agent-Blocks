@@ -1,0 +1,65 @@
+{
+  "identity": {
+    "agentName": "openclaw_art_studio",
+    "displayName": "OpenClaw Art Studio",
+    "description": "Turns a short text prompt into a vibrant, painterly illustration (PNG) using the configured image provider.",
+    "version": "1.0.0",
+    "provider": {
+      "organization": "openclaw-foundation"
+    }
+  },
+  "capabilities": {
+    "taskKinds": ["request"]
+  },
+  "io": {
+    "inputs": [
+      {
+        "id": "request",
+        "description": "Short text to render as an illustration (max 400 characters).",
+        "contentType": "application/json",
+        "required": true,
+        "example": {
+          "text": "a lighthouse at dawn"
+        },
+        "schema": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "id": "art",
+        "description": "Generated illustration image.",
+        "contentType": "image/png",
+        "guaranteed": true
+      }
+    ]
+  },
+  "tags": [
+    {
+      "id": "text-to-image",
+      "name": "Text to Image",
+      "description": "Generate a PNG illustration from a short text prompt."
+    }
+  ],
+  "extensions": {
+    "blocks": {
+      "billingMode": "free",
+      "pricePerTask": "0.000",
+      "listing": "public"
+    }
+  },
+  "runtime": {
+    "handler": "./handler.ts",
+    "handlerExport": "default",
+    "concurrency": 1,
+    "expectedInstances": 1,
+    "maxRunningTimeSec": 90
+  }
+}
