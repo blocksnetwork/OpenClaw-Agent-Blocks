@@ -42,6 +42,7 @@ import { resolveAgentBlocksCredential } from '../blocks/agent-keyring.ts';
 import { connect } from '../blocks/blocks-client.ts';
 import { runSkill } from '../blocks/openclaw-client.ts';
 import { understandsImage } from '../routing/intent-tags.ts';
+import { peerCoordinationPersonRef, looksPeerCoordination, stripTerminalPunctuation } from '../routing/peer-coordination.ts';
 import { authorizeOwner, authorizeInvited, type OwnerPolicy } from '../server/authorize.ts';
 import { loadRoster, resolvePeerReference, type Peer } from './assistant-roster.ts';
 import {
@@ -54,6 +55,22 @@ import {
 } from '../a2a/a2a.ts';
 import { recordA2ACall, withinDailyCap } from '../a2a/a2a-budget.ts';
 import { recordHop } from '../a2a/a2a-audit.ts';
+import {
+  proposeMeetingRequest,
+  acceptMeetingRequest,
+  declineMeetingRequest,
+  readMeetingRequest,
+  meetingRequestsForOwner,
+  notificationsFor,
+  buildNotification,
+  meetingConfirmToken,
+  type MeetingSlot,
+  type MeetingParty,
+  type MeetingRequestRecord,
+  type MeetingRequestNotification,
+  type OwnerNotify,
+} from '../a2a/meeting-request.ts';
+import type { NegotiationBooking, NegotiationBookingSide } from '../a2a/negotiate.ts';
 import {
   bookingResultSucceeded,
   findBookingProposal,
@@ -132,7 +149,7 @@ let loggedBrainFallback = false;
  * discovery order when ranking can't separate sparse-metadata agents, so a
  * usable agent is never dropped.
  */
-function chooseSpecialist(
+export function chooseSpecialist(
   agents: DiscoveredAgent[],
   tag: string,
   prompt?: string,
@@ -242,6 +259,16 @@ export interface RunAssistantOpts {
   integrationStoreBaseDir?: string;
   /** Optional deterministic idempotency id for write checks/retries. */
   writeIdempotencyId?: string;
+  /** Base dir for the two-sided MeetingRequest store (shared across owners so
+   *  both parties converge on ONE record). When set, peer coordination becomes
+   *  a two-sided handshake: the initiator parks a `pending-both` request and
+   *  the inbound peer is notified + must accept before any calendar write. */
+  meetingRequestBaseDir?: string;
+  /** Owner-scoped notification sink (the dashboard's owner SSE channel). When
+   *  present, peer-coordination proposals notify BOTH owners. */
+  onOwnerNotify?: OwnerNotify;
+  /** Hold/request TTL for a proposed meeting (defaults in meeting-request). */
+  meetingHoldTtlMs?: number;
   /** Injectable skill runner for checks that need a precise plan. */
   runSkillImpl?: RunSkillImpl;
   /** Force the offline switch (defaults to FOUNDATION_OFFLINE !== '0'). */
@@ -362,6 +389,10 @@ export async function buildMultiTenantAssistantRoute(
     integrationStoreBaseDir: opts.integrationStoreBaseDir
       ?? defaults.integrationStoreBaseDir
       ?? join(stateBaseDir, 'integrations'),
+    // The MeetingRequest store is CROSS-owner (one record spans both parties),
+    // so it lives in a shared dir — NOT under a per-owner key — so the
+    // initiator side and the peer side read/write the SAME state machine.
+    meetingRequestBaseDir: defaults.meetingRequestBaseDir ?? join(stateBaseDir, 'meeting-requests'),
     profileStoreBaseDir,
     contactsStoreBaseDir,
     ...(ownerContext ? { ownerContext } : {}),
@@ -370,6 +401,104 @@ export async function buildMultiTenantAssistantRoute(
   };
 
   return { ownerId: trimmedOwnerId, ownerKey, policy, opts: perOwnerOpts };
+}
+
+/* ===========================================================================
+ * Two-sided meeting handshake — dashboard-facing orchestration.
+ *
+ * The dashboard owns the notification transport; this exposes the small,
+ * owner-resolved seam it needs so it never reimplements the state machine or a
+ * second booking path. Booking sides are built from each owner's OWN route
+ * (owner-local calendar runner + booking-audit dir), preserving the
+ * owner-only write invariant `negotiate.ts` already enforces.
+ * ======================================================================== */
+
+async function meetingBookingSide(
+  party: MeetingParty,
+  slot: MeetingSlot,
+  offline: boolean,
+  opts: MultiTenantAssistantOpts,
+): Promise<NegotiationBookingSide> {
+  const route = await buildMultiTenantAssistantRoute(party.ownerId, opts);
+  const ownerId = party.ownerId;
+  const runIntegration: RunIntegration =
+    route.opts.runIntegration
+    ?? (async (tool, args, o) => {
+      const run = await resolveDefaultIntegration(o.offline, tool, ownerId, route.opts);
+      return run(tool, args, o);
+    });
+  return {
+    assistant: party.assistant || route.opts.selfHandle || ownerId,
+    ownerId,
+    // Holds/commit are gated by the MeetingRequest state machine (both owners
+    // already accepted), so the owner-local write runs directly.
+    bookingPolicy: 'auto',
+    ...(route.opts.bookingAuditBaseDir ? { bookingAuditBaseDir: route.opts.bookingAuditBaseDir } : {}),
+    runIntegration,
+    taskIdPrefix: ownerStateKey(ownerId),
+    event: { summary: 'Meeting', durationMinutes: slot.durationMinutes },
+    // Offline stub calendars don't model a tentative→busy patch; a live
+    // adapter would patch the held event here.
+    confirmHold: () => {},
+    offline,
+  };
+}
+
+/** Build the two-sided booking for a meeting record from each owner's route. */
+export async function buildMeetingBooking(
+  record: MeetingRequestRecord,
+  opts: MultiTenantAssistantOpts,
+): Promise<NegotiationBooking> {
+  const offline = (opts.env ?? process.env).FOUNDATION_OFFLINE !== '0';
+  const self = await meetingBookingSide(record.initiator, record.slot, offline, opts);
+  const peer = await meetingBookingSide(record.peer, record.slot, offline, opts);
+  return { self, peer };
+}
+
+function meetingRequestStoreDir(opts: MultiTenantAssistantOpts, env: NodeJS.ProcessEnv): string {
+  return opts.runAssistantDefaults?.meetingRequestBaseDir
+    ?? join(multiTenantStateBaseDir(opts.stateBaseDir, env), 'meeting-requests');
+}
+
+/**
+ * Accept or decline a meeting request for one owner (the dashboard endpoint).
+ * Validates the owner's PAIRED token, records the response (idempotent), and —
+ * on the second acceptance — drives the bilateral commit in the same call.
+ * Returns the fresh record plus the owner-scoped notifications the caller
+ * should fan out (already share-policy scoped per recipient).
+ */
+export async function respondToMeetingRequest(
+  args: { threadId: string; ownerId: string; decision: 'accept' | 'decline'; confirmToken?: string },
+  opts: MultiTenantAssistantOpts,
+): Promise<{ ok: boolean; record: MeetingRequestRecord | null; error?: string; notifications: MeetingRequestNotification[] }> {
+  const env = opts.env ?? process.env;
+  const storeOpts = { baseDir: meetingRequestStoreDir(opts, env) };
+  const record = await readMeetingRequest(args.threadId, storeOpts);
+  if (!record) return { ok: false, record: null, error: 'unknown meeting request', notifications: [] };
+  if (!(record.initiator.ownerId === args.ownerId || record.peer.ownerId === args.ownerId)) {
+    return { ok: false, record, error: 'owner is not a party to this meeting request', notifications: [] };
+  }
+
+  const booking = await buildMeetingBooking(record, opts);
+  const result =
+    args.decision === 'accept'
+      ? await acceptMeetingRequest({ threadId: args.threadId, ownerId: args.ownerId, confirmToken: args.confirmToken }, booking, storeOpts)
+      : await declineMeetingRequest({ threadId: args.threadId, ownerId: args.ownerId }, booking, storeOpts);
+
+  if (result.error && !result.changed) {
+    return { ok: false, record: result.record, error: result.error, notifications: [] };
+  }
+  return { ok: true, record: result.record, notifications: notificationsFor(result.record) };
+}
+
+/** The current meeting requests an owner is a party to — the feed a dashboard
+ *  channel replays when it first subscribes. */
+export async function listOwnerMeetingRequests(
+  ownerId: string,
+  opts: MultiTenantAssistantOpts,
+): Promise<MeetingRequestRecord[]> {
+  const env = opts.env ?? process.env;
+  return meetingRequestsForOwner(ownerId, { baseDir: meetingRequestStoreDir(opts, env) });
 }
 
 export function multiTenantStateBaseDir(
@@ -630,6 +759,16 @@ async function runInboundA2A(
   ctx?.reportStatus(`personal agent: answering A2A "${request.intent}" (share-policy filtered)`);
   const offline = opts.offline ?? process.env.FOUNDATION_OFFLINE !== '0';
 
+  // (Two-sided handshake, item 5) A COORDINATION request to set up a meeting
+  // is NOT silently auto-answered anymore. We PARK it and notify THIS owner —
+  // the bound peer (`policy.ownerId`), NEVER the caller (`task.ownerId`) — so
+  // their dashboard shows an incoming meeting request they must accept before
+  // anything is committed. A bare free/busy PROBE ("free-busy") is unaffected
+  // and still answered per share policy below.
+  if (isCoordinationBookingIntent(request.intent)) {
+    return parkInboundCoordination(request, shared, peer, policy, selfHandle, ctx, opts);
+  }
+
   if (isFreeBusyA2AIntent(request.intent)) {
     if (peer?.sharePolicy?.freeBusy !== true) {
       await recordInboundHop(request, selfHandle, opts, 'refused');
@@ -697,11 +836,79 @@ function isFreeBusyA2AIntent(intent: string): boolean {
   return /\b(free[-\s]?busy|availability|available|both free|mutual availability|find a time|calendar)\b/u.test(normalized);
 }
 
+/** A COORDINATION-to-BOOK intent (as opposed to a bare free/busy probe). The
+ *  initiator's repaired call-peer intent carries the shared, intent-shaped
+ *  coordination phrasing ("Find mutual availability for this request: …"), so
+ *  we reuse the ONE detector (peer-coordination.ts) rather than a new keyword
+ *  copy. A plain "free-busy" probe returns null here and stays auto-answered. */
+function isCoordinationBookingIntent(intent: string): boolean {
+  return looksPeerCoordination(intent) || /\bfind\s+mutual\s+availability\b/u.test(intent.toLowerCase());
+}
+
+/**
+ * PARK an inbound coordination request instead of silently answering with
+ * free/busy. Notifies THIS owner (the bound peer) that a meeting request has
+ * arrived — carrying ONLY policy-shared fields, never the caller's raw intent
+ * (which may embed a private meeting title). The concrete slot + accept token
+ * ride the initiator's `MeetingRequest` record; this notification simply puts
+ * the peer's owner in the loop.
+ */
+async function parkInboundCoordination(
+  request: A2ARequest,
+  shared: OwnerContext,
+  peer: Peer | undefined,
+  policy: OwnerPolicy,
+  selfHandle: string,
+  ctx: TaskContext | undefined,
+  opts: RunAssistantOpts,
+): Promise<HandlerResult> {
+  // Owner attribution: notifications ALWAYS target the bound owner
+  // (policy.ownerId), NEVER task.ownerId (which is the CALLER for the invite
+  // gate). This is the structural fix for the dashboardLocalA2A mis-attribution.
+  const peerOwnerId = policy.ownerId ?? '';
+  const sharesTitles = peer?.sharePolicy?.meetingTitles === true;
+
+  if (peerOwnerId) {
+    const notification: MeetingRequestNotification = {
+      type: 'meeting-request',
+      event: 'proposed',
+      threadId: request.threadId,
+      toOwnerId: peerOwnerId,
+      role: 'peer',
+      status: 'pending-both',
+      // The initiator proposes the concrete slot; the peer sees it when the
+      // initiator's record lands. Kept empty here to avoid inventing one.
+      slot: { start: '', end: '', durationMinutes: 0 },
+      fromLabel: request.from,
+      ...(Object.keys(shared).length ? { shared: shared as Record<string, unknown> } : {}),
+      // Never echo the raw intent (may contain a private title) unless titles
+      // are explicitly shared with this peer.
+      summary: sharesTitles ? stripTerminalPunctuation(request.intent) : 'Meeting request',
+      message: `Incoming meeting request from ${request.from} — review and accept to book it.`,
+    };
+    await opts.onOwnerNotify?.(notification);
+  }
+
+  ctx?.reportStatus('personal agent: parked A2A coordination — notified owner (awaiting acceptance)');
+  await recordInboundHop(request, selfHandle, opts, 'parked');
+
+  return jsonArtifact({
+    ok: true,
+    a2a: true,
+    parked: true,
+    intent: request.intent,
+    from: request.from,
+    threadId: request.threadId,
+    shared,
+    reply: "I've flagged this meeting request for my owner. They'll accept or decline before anything is booked.",
+  });
+}
+
 async function recordInboundHop(
   request: A2ARequest,
   selfHandle: string,
   opts: RunAssistantOpts,
-  outcome: 'answered' | 'refused',
+  outcome: 'answered' | 'refused' | 'parked',
 ): Promise<void> {
   await recordHop(
     {
@@ -903,10 +1110,14 @@ function ownerProfilePlanInputs(profile: OwnerProfile | undefined): Record<strin
   return Object.keys(owner).length > 1 ? { owner } : {};
 }
 
-/** Live planners sometimes collapse "coordinate with Bob so we are both free"
- * into a local calendar read. Repair only that narrow mutual-availability
- * shape into the intended sequence: check my calendar, then ask the named
- * peer. The runtime still resolves `personRef` against the roster. */
+/** Live planners sometimes collapse a mutual-availability request ("coordinate
+ * with Bob so we are both free", or the terse "find a time for me and Bob to
+ * meet") into a local calendar read. Repair only that shape into the intended
+ * sequence: check my calendar, then ask the named peer. Coordination is
+ * detected by the ONE shared, intent-shaped `peerCoordinationPersonRef`
+ * (src/routing/peer-coordination.ts) the offline stub uses too, so the repair
+ * and the stub can never disagree. The runtime still resolves `personRef`
+ * against the roster. */
 function repairPeerCoordinationPlan(request: string, plan: AssistantPlan): AssistantPlan {
   if (plan.steps.some((step) => step.kind === 'call-peer')) return plan;
   const personRef = peerCoordinationPersonRef(request);
@@ -936,45 +1147,6 @@ function repairPeerCoordinationPlan(request: string, plan: AssistantPlan): Assis
     steps,
     actions: steps,
   };
-}
-
-function peerCoordinationPersonRef(request: string): string | null {
-  const lower = request.toLowerCase();
-  const coordinates =
-    /\b(coordinat\w*|compare|mutual|together)\b/u.test(lower) ||
-    /\bworks?\s+for\s+both\b/u.test(lower) ||
-    /\bboth\b.*\b(free|available|availability|busy)\b/u.test(lower) ||
-    /\b(free|available|availability|busy)\b.*\bboth\b/u.test(lower);
-  const asksAvailability =
-    /\b(free|busy|available|availability|calendar|time|slot|meeting|schedule|morning|afternoon|evening)\b/u.test(lower);
-  if (!coordinates || !asksAvailability) return null;
-
-  const patterns = [
-    /\bwith\s+(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
-    /\b(?:ask|coordinate|check|compare|sync)\s+(?:with\s+)?(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
-    /\b(@?[a-z][a-z0-9_.@'’-]*)\s+and\s+(?:i|me)\b/iu,
-    /\b(?:i|me)\s+and\s+(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
-  ];
-  for (const pattern of patterns) {
-    const match = request.match(pattern);
-    const ref = normalizePeerReference(match?.[1]);
-    if (ref) return ref;
-  }
-  return null;
-}
-
-function normalizePeerReference(value: string | undefined): string | null {
-  const ref = (value ?? '')
-    .replace(/['’]s$/u, '')
-    .replace(/[^\p{L}\p{N}_@.'’-]+$/gu, '')
-    .trim();
-  if (!ref) return null;
-  if (/^(me|my|mine|i|you|your|calendar|meeting|event|call|time|slot|the|a|an)$/iu.test(ref)) return null;
-  return ref;
-}
-
-function stripTerminalPunctuation(value: string): string {
-  return value.trim().replace(/[.!?]+$/u, '');
 }
 
 function directProfileReply(request: string, profile: OwnerProfile | undefined): string | undefined {
@@ -1827,7 +1999,90 @@ async function executePlanFrom(
     }
   }
 
-  return synthesizeStepPlan(plan, ledger, { complete: true }, opts);
+  const result = synthesizeStepPlan(plan, ledger, { complete: true }, opts);
+  return parkInitiatorMeetingRequest(result, policy, selfHandle, opts, ctx);
+}
+
+/**
+ * (Two-sided handshake, item 1) When a coordination plan finds a mutual slot,
+ * DON'T emit a single-owner auto-commit — PARK a `pending-both` MeetingRequest
+ * keyed by the shared threadId and notify BOTH owners. The slot suggestion
+ * (`suggestedBooking`) still rides the reply (unchanged for the single-owner
+ * probe path), but the commit now requires both owners to accept. Only runs
+ * when a MeetingRequest store is configured (the multi-tenant dashboard); the
+ * single-owner unit paths are byte-for-byte unchanged.
+ */
+async function parkInitiatorMeetingRequest(
+  result: HandlerResult,
+  policy: OwnerPolicy,
+  selfHandle: string,
+  opts: RunAssistantOpts,
+  ctx: TaskContext | undefined,
+): Promise<HandlerResult> {
+  if (!opts.meetingRequestBaseDir) return result;
+  const payload = parseHandlerPayload(result);
+  const sb = payload.suggestedBooking;
+  if (!isRecord(sb)) return result;
+
+  const initiatorOwnerId = policy.ownerId ?? '';
+  const peerHandle = typeof sb.peerHandle === 'string' ? sb.peerHandle : '';
+  const threadId = typeof sb.threadId === 'string' ? sb.threadId : '';
+  if (!initiatorOwnerId || !peerHandle || !threadId) return result;
+
+  // Peer owner is resolved from the roster (roster-driven; never a pinned
+  // `pa_*` handle). Without it we can't run a two-sided handshake, so fall
+  // back to the unchanged single-owner suggestion.
+  const roster = selfHandle ? await loadRoster(selfHandle, { baseDir: opts.rosterBaseDir }) : null;
+  const peer = roster?.peers.find((p) => p.agentName === peerHandle);
+  const peerOwnerId = peer?.ownerId?.trim();
+  if (!peerOwnerId) return result;
+
+  const slot: MeetingSlot = {
+    start: String(sb.start ?? ''),
+    end: String(sb.end ?? ''),
+    durationMinutes: typeof sb.durationMinutes === 'number' ? sb.durationMinutes : 30,
+    ...(typeof sb.slotLabel === 'string' ? { label: sb.slotLabel } : {}),
+  };
+  const initiator: MeetingParty = {
+    ownerId: initiatorOwnerId,
+    assistant: selfHandle,
+    ...(opts.ownerProfile?.displayName ? { displayName: opts.ownerProfile.displayName } : {}),
+  };
+  const peerParty: MeetingParty = {
+    ownerId: peerOwnerId,
+    assistant: peerHandle,
+    ...(peer?.ownerName || peer?.displayName || typeof sb.peerName === 'string'
+      ? { displayName: peer?.ownerName ?? peer?.displayName ?? String(sb.peerName) }
+      : {}),
+  };
+
+  // Notification-only creation (this side has only ITS OWN calendar); the
+  // dashboard, which can reach both owners, places holds and commits.
+  const { record } = await proposeMeetingRequest(
+    { threadId, slot, initiator, peer: peerParty, ...(opts.meetingHoldTtlMs ? { holdTtlMs: opts.meetingHoldTtlMs } : {}) },
+    undefined,
+    { baseDir: opts.meetingRequestBaseDir },
+  );
+
+  if (opts.onOwnerNotify) {
+    // Peer sees an actionable "Incoming meeting request"; initiator sees
+    // "Waiting for <peer> to accept". Delivery keys on each recipient's own id.
+    await opts.onOwnerNotify(buildNotification(record, record.peer.ownerId, 'proposed'));
+    await opts.onOwnerNotify(buildNotification(record, record.initiator.ownerId, 'proposed'));
+  }
+  ctx?.reportStatus(`personal agent: proposed meeting to ${peerParty.displayName ?? peerHandle} — awaiting both owners' acceptance`);
+
+  return jsonArtifact({
+    ...payload,
+    meetingRequest: {
+      threadId: record.threadId,
+      status: record.status,
+      slot: record.slot,
+      peerOwnerId: record.peer.ownerId,
+      // The initiator accepts THEIR side with this paired token.
+      confirmToken: meetingConfirmToken(record.threadId, initiatorOwnerId),
+    },
+  });
 }
 
 /** Dispatch one step and classify its result for the loop. Single-step
@@ -2109,9 +2364,13 @@ function synthesizeStepPlan(
   meta: SynthMeta,
   opts: RunAssistantOpts,
 ): HandlerResult {
-  void opts;
   const lines: string[] = [];
-  const suggestedBooking = meta.complete ? mutualAvailabilitySuggestion(plan, ledger) : null;
+  const suggestedBooking = meta.complete
+    ? mutualAvailabilitySuggestion(plan, ledger, {
+        workingHours: ownerWorkingHours(opts),
+        timezone: effectiveTimezone(opts),
+      })
+    : null;
   if (suggestedBooking) {
     lines.push(`You and ${suggestedBooking.peerName} are both free ${suggestedBooking.mutualWindowLabel}.`);
     lines.push(`Suggested slot: ${suggestedBooking.slotLabel}.`);
@@ -2166,6 +2425,8 @@ function synthesizeStepPlan(
 interface SuggestedBooking {
   peerName: string;
   peerHandle?: string;
+  /** The shared A2A thread this proposal belongs to — the MeetingRequest key. */
+  threadId?: string;
   start: string;
   end: string;
   slotLabel: string;
@@ -2182,29 +2443,53 @@ interface CalendarAvailability {
   freeBusy: unknown[];
 }
 
-function mutualAvailabilitySuggestion(plan: AssistantPlan, ledger: LedgerEntry[]): SuggestedBooking | null {
+function mutualAvailabilitySuggestion(
+  plan: AssistantPlan,
+  ledger: LedgerEntry[],
+  clamp: { workingHours: { start: string; end: string }; timezone: string },
+): SuggestedBooking | null {
   const local = ledger.find((entry) => entry.kind === 'use-integration' && entry.classification === 'satisfied');
   const peer = ledger.find((entry) => entry.kind === 'call-peer' && entry.classification === 'satisfied');
   if (!local || !peer) return null;
 
   const localAvailability = calendarAvailabilityFromPayload(local.payload);
+  if (!localAvailability) return null;
+  // The peer may have PARKED (two-sided handshake) and shared no calendar
+  // window. When it did share free/busy (probe path), intersect both windows;
+  // otherwise propose from the owner's OWN availability and let the peer's
+  // owner accept/decline against their real calendar.
   const peerAvailability = calendarAvailabilityFromPayload(peer.payload);
-  if (!localAvailability || !peerAvailability) return null;
 
-  const startMs = Math.max(localAvailability.startMs, peerAvailability.startMs);
-  const endMs = Math.min(localAvailability.endMs, peerAvailability.endMs);
+  const startMs = peerAvailability ? Math.max(localAvailability.startMs, peerAvailability.startMs) : localAvailability.startMs;
+  const endMs = peerAvailability ? Math.min(localAvailability.endMs, peerAvailability.endMs) : localAvailability.endMs;
   if (endMs <= startMs) return null;
 
   const durationMinutes = suggestedMeetingDurationMinutes(plan);
   const durationMs = durationMinutes * 60_000;
-  const slotStartMs = firstFreeSlot(startMs, endMs, durationMs, [
+  const busy = [
     ...busyIntervals(localAvailability.freeBusy),
-    ...busyIntervals(peerAvailability.freeBusy),
-  ]);
+    ...(peerAvailability ? busyIntervals(peerAvailability.freeBusy) : []),
+  ];
+  const sourceTime = localAvailability.timeMin || peerAvailability?.timeMin || '';
+  // HARD constraint: unless the owner named an explicit time, the earliest
+  // mutual gap must fall inside the INITIATOR's working hours (expressed in
+  // their timezone). Peer working hours aren't shared today (the A2A payload
+  // only carries free/busy), so we clamp to the initiator's hours and let the
+  // peer's free/busy narrow it further.
+  const slotStartMs = planMentionsExplicitTime(plan)
+    ? firstFreeSlot(startMs, endMs, durationMs, busy)
+    : pickWorkingHoursSlot({
+        startMs,
+        endMs,
+        durationMs,
+        busy,
+        workingHours: clamp.workingHours,
+        timezone: clamp.timezone,
+        sourceIsAbsolute: isAbsoluteIsoTime(sourceTime),
+      });
   if (slotStartMs === null) return null;
 
   const slotEndMs = slotStartMs + durationMs;
-  const sourceTime = localAvailability.timeMin || peerAvailability.timeMin;
   const start = formatLikeIntegrationTime(new Date(slotStartMs), sourceTime);
   const end = formatLikeIntegrationTime(new Date(slotEndMs), sourceTime);
   const slotLabel = compactWindowLabel(start, end);
@@ -2214,11 +2499,13 @@ function mutualAvailabilitySuggestion(plan: AssistantPlan, ledger: LedgerEntry[]
   );
   const peerName = peerDisplayName(peer.payload) ?? 'Bob';
   const peerHandle = peerHandleFromPayload(peer.payload);
+  const threadId = peerThreadIdFromPayload(peer.payload);
   const prompt = `Book a meeting with ${peerName} on ${start.slice(0, 10)} from ${clockPrompt(start)} to ${clockPrompt(end)}.`;
 
   return {
     peerName,
     ...(peerHandle ? { peerHandle } : {}),
+    ...(threadId ? { threadId } : {}),
     start,
     end,
     slotLabel,
@@ -2226,6 +2513,15 @@ function mutualAvailabilitySuggestion(plan: AssistantPlan, ledger: LedgerEntry[]
     durationMinutes,
     prompt,
   };
+}
+
+/** The shared A2A threadId carried on the peer step's result envelope. */
+function peerThreadIdFromPayload(payload: Record<string, unknown>): string | undefined {
+  const a2a = isRecord(payload.a2a) ? payload.a2a : undefined;
+  if (a2a && typeof a2a.threadId === 'string' && a2a.threadId.trim()) return a2a.threadId;
+  const peer = isRecord(payload.peer) ? payload.peer : undefined;
+  if (peer && typeof peer.threadId === 'string' && peer.threadId.trim()) return peer.threadId;
+  return undefined;
 }
 
 function calendarAvailabilityFromPayload(payload: Record<string, unknown>): CalendarAvailability | null {
@@ -2295,6 +2591,241 @@ function firstFreeSlot(
     if (cursor >= endMs) return null;
   }
   return cursor + durationMs <= endMs ? cursor : null;
+}
+
+/* ---- Working-hours clamp (hard constraint on slot selection) ----------- */
+
+/** The sane per-owner default when a profile carries no working hours:
+ *  09:00–17:00 in the owner's local timezone. Read per-owner via
+ *  `ownerWorkingHours`; never a single global company constant. */
+const DEFAULT_WORKING_HOURS = { start: '09:00', end: '17:00' } as const;
+
+/** The owner's working hours from their profile, or the sane default. */
+function ownerWorkingHours(opts: RunAssistantOpts): { start: string; end: string } {
+  const wh = opts.ownerProfile?.workingHours;
+  if (wh && typeof wh.start === 'string' && typeof wh.end === 'string' && parseHm(wh.start) && parseHm(wh.end)) {
+    return { start: wh.start, end: wh.end };
+  }
+  return { start: DEFAULT_WORKING_HOURS.start, end: DEFAULT_WORKING_HOURS.end };
+}
+
+function parseHm(value: string): { hour: number; minute: number } | null {
+  const match = value.trim().match(/^(\d{1,2}):(\d{2})$/u);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return { hour, minute };
+}
+
+/** A time string is absolute when it carries a UTC `Z` or a numeric offset;
+ *  otherwise it is a naive local wall-clock time. */
+function isAbsoluteIsoTime(value: string): boolean {
+  return /Z$|[+-]\d{2}:\d{2}$/u.test(value);
+}
+
+/** Did the owner name an explicit clock time anywhere in the plan? Explicit
+ *  times ("at 8pm", "20:00", "noon") are HONORED — the working-hours clamp is
+ *  for inferring an unspecified window, not for overriding a clear request. */
+function planMentionsExplicitTime(plan: AssistantPlan): boolean {
+  const text = plan.steps
+    .map((step) => {
+      if (step.kind === 'call-peer') return step.intent ?? '';
+      if (step.kind === 'use-integration') return typeof step.args?.query === 'string' ? step.args.query : '';
+      return '';
+    })
+    .join(' ');
+  return queryMentionsExplicitTime(text);
+}
+
+function queryMentionsExplicitTime(text: string): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  if (/\b\d{1,2}\s*(?:am|pm)\b/u.test(lower)) return true;
+  if (/\b\d{1,2}:\d{2}\b/u.test(lower)) return true;
+  if (/\b(?:noon|midnight)\b/u.test(lower)) return true;
+  return false;
+}
+
+type WallMode = { kind: 'iana'; tz: string } | { kind: 'local' };
+
+function wallModeFor(sourceIsAbsolute: boolean, timezone: string): WallMode {
+  // Absolute instants are anchored in the owner's timezone (DST/offset-safe).
+  // Naive strings are already local wall-clock, so we read them as-is.
+  return sourceIsAbsolute ? { kind: 'iana', tz: timezone || 'UTC' } : { kind: 'local' };
+}
+
+interface WallParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+}
+
+/** The local wall-clock parts of an instant in the given mode. */
+function wallPartsOf(ms: number, mode: WallMode): WallParts {
+  if (mode.kind === 'local') {
+    const dt = new Date(ms);
+    return { year: dt.getFullYear(), month: dt.getMonth() + 1, day: dt.getDate(), hour: dt.getHours(), minute: dt.getMinutes() };
+  }
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: mode.tz,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).formatToParts(new Date(ms));
+  const map: Record<string, string> = {};
+  for (const part of parts) map[part.type] = part.value;
+  let hour = Number(map.hour);
+  if (hour === 24) hour = 0;
+  return { year: Number(map.year), month: Number(map.month), day: Number(map.day), hour, minute: Number(map.minute) };
+}
+
+/** The instant (ms) for a local wall-clock time in the given mode. For an
+ *  IANA zone this is DST/offset-safe (it resolves the real offset at the
+ *  target instant rather than assuming a fixed offset). */
+function wallToMs(year: number, month: number, day: number, hour: number, minute: number, mode: WallMode): number {
+  if (mode.kind === 'local') return new Date(year, month - 1, day, hour, minute, 0, 0).getTime();
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+  const offset1 = ianaOffsetMs(mode.tz, utcGuess);
+  let ms = utcGuess - offset1;
+  const offset2 = ianaOffsetMs(mode.tz, ms);
+  if (offset2 !== offset1) ms = utcGuess - offset2;
+  return ms;
+}
+
+/** The timezone offset (ms) of an IANA zone at a given UTC instant. */
+function ianaOffsetMs(tz: string, utcMs: number): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(new Date(utcMs));
+  const map: Record<string, string> = {};
+  for (const part of parts) map[part.type] = part.value;
+  let hour = Number(map.hour);
+  if (hour === 24) hour = 0;
+  const asUtc = Date.UTC(Number(map.year), Number(map.month) - 1, Number(map.day), hour, Number(map.minute), Number(map.second));
+  return asUtc - utcMs;
+}
+
+/** Split `[startMs, endMs]` into the owner's working-hours sub-window for
+ *  each local day it spans, in chronological order. DST-safe: day boundaries
+ *  are computed per local calendar day, not by adding a fixed 24h. */
+function workingHourWindows(
+  startMs: number,
+  endMs: number,
+  workingHours: { start: string; end: string },
+  mode: WallMode,
+): Array<{ start: number; end: number }> {
+  const open = parseHm(workingHours.start);
+  const close = parseHm(workingHours.end);
+  // Malformed hours: no clamp (fail open to the raw window).
+  if (!open || !close) return [{ start: startMs, end: endMs }];
+
+  const windows: Array<{ start: number; end: number }> = [];
+  let { year, month, day } = wallPartsOf(startMs, mode);
+  for (let i = 0; i < 366; i++) {
+    const dayMidnight = wallToMs(year, month, day, 0, 0, mode);
+    if (dayMidnight > endMs) break;
+    const whStart = wallToMs(year, month, day, open.hour, open.minute, mode);
+    const whEnd = wallToMs(year, month, day, close.hour, close.minute, mode);
+    const lo = Math.max(whStart, startMs);
+    const hi = Math.min(whEnd, endMs);
+    if (hi > lo) windows.push({ start: lo, end: hi });
+    const next = new Date(Date.UTC(year, month - 1, day + 1));
+    year = next.getUTCFullYear();
+    month = next.getUTCMonth() + 1;
+    day = next.getUTCDate();
+  }
+  return windows;
+}
+
+export interface WorkingHoursSlotInput {
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  busy: Array<{ start: number; end: number }>;
+  workingHours: { start: string; end: string };
+  timezone: string;
+  /** Whether the source times are absolute instants (`Z`/offset). Naive
+   *  strings are treated as local wall-clock. */
+  sourceIsAbsolute: boolean;
+}
+
+/**
+ * The earliest free slot that ALSO falls within the owner's working hours in
+ * the owner's timezone. Returns null when no in-hours mutual gap exists (the
+ * caller must NOT fall back to an out-of-hours slot).
+ */
+export function pickWorkingHoursSlot(input: WorkingHoursSlotInput): number | null {
+  const mode = wallModeFor(input.sourceIsAbsolute, input.timezone);
+  const windows = workingHourWindows(input.startMs, input.endMs, input.workingHours, mode);
+  for (const window of windows) {
+    const slot = firstFreeSlot(window.start, window.end, input.durationMs, input.busy);
+    if (slot !== null) return slot;
+  }
+  return null;
+}
+
+/**
+ * Working-hours WRITE guard (defense in depth). When the owner named an
+ * explicit time it is honored; otherwise an inferred booking that lands
+ * outside working hours is refused rather than committed — so a bad LLM
+ * extraction can't quietly book 9pm.
+ */
+function guardWriteWorkingHours(
+  start: string,
+  end: string,
+  query: string,
+  workingHours: { start: string; end: string },
+  timezone: string,
+): { ok: true } | { ok: false; reply: string } {
+  if (queryMentionsExplicitTime(query)) return { ok: true };
+  if (bookingWithinWorkingHours(start, end, workingHours, timezone)) return { ok: true };
+  return {
+    ok: false,
+    reply:
+      `That time is outside your working hours (${workingHours.start}–${workingHours.end}). `
+      + `Tell me a time within your working hours, or state the exact time you want (e.g. "at 8pm") and I'll book it.`,
+  };
+}
+
+function bookingWithinWorkingHours(
+  start: string,
+  end: string,
+  workingHours: { start: string; end: string },
+  timezone: string,
+): boolean {
+  const open = parseHm(workingHours.start);
+  const close = parseHm(workingHours.end);
+  if (!open || !close) return true;
+  const startMs = new Date(start).getTime();
+  const endMs = new Date(end).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return true;
+  const mode = wallModeFor(isAbsoluteIsoTime(start), timezone);
+  const startParts = wallPartsOf(startMs, mode);
+  const endParts = wallPartsOf(endMs, mode);
+  const startMinutes = startParts.hour * 60 + startParts.minute;
+  const endMinutes = endParts.hour * 60 + endParts.minute;
+  const openMinutes = open.hour * 60 + open.minute;
+  const closeMinutes = close.hour * 60 + close.minute;
+  if (startMinutes < openMinutes) return false;
+  // A meeting that ends exactly at the working-hours boundary is fine; one
+  // that runs past it (or spills into another local day) is not.
+  const endsSameDay = endParts.year === startParts.year && endParts.month === startParts.month && endParts.day === startParts.day;
+  if (!endsSameDay) return false;
+  if (endMinutes > closeMinutes) return false;
+  return true;
 }
 
 function suggestedMeetingDurationMinutes(plan: AssistantPlan): number {
@@ -2634,12 +3165,18 @@ async function prepareWriteArgs(
   const normalized = { ...args };
   const hasStart = typeof normalized.start === 'string' && normalized.start.trim() !== '';
   const hasEnd = typeof normalized.end === 'string' && normalized.end.trim() !== '';
+  // Pre-supplied start/end come straight from the plan (e.g. the clamped
+  // mutual-availability suggestion) — treated as an explicit time and honored.
   if (hasStart && hasEnd) return { ok: true, args: normalized };
 
   const query = stringArg(normalized.query) ?? stringArg(normalized.summary) ?? stringArg(normalized.title) ?? '';
+  const workingHours = ownerWorkingHours(opts);
+  const timezone = effectiveTimezone(opts);
   const extracted = await extractCalendarBookingWithBrain(query, offline, opts);
   if (extracted) {
     if (!extracted.ok) return { ok: false, reply: extracted.reply };
+    const guard = guardWriteWorkingHours(extracted.start, extracted.end, query, workingHours, timezone);
+    if (!guard.ok) return { ok: false, reply: guard.reply };
     normalized.summary = stringArg(normalized.summary) ?? extracted.summary;
     normalized.start = extracted.start;
     normalized.end = extracted.end;
@@ -2649,6 +3186,8 @@ async function prepareWriteArgs(
   const parsed = parseCalendarBookingQuery(query, new Date());
   if (!parsed.ok) return { ok: false, reply: parsed.reply };
 
+  const guard = guardWriteWorkingHours(parsed.start, parsed.end, query, workingHours, timezone);
+  if (!guard.ok) return { ok: false, reply: guard.reply };
   normalized.summary = stringArg(normalized.summary) ?? parsed.summary;
   normalized.start = parsed.start;
   normalized.end = parsed.end;
@@ -3094,7 +3633,14 @@ async function resolveDefaultIntegration(
       }
       const mod = await import('../integrations/calendar-mcp.ts');
       console.log('personal agent: using live calendar integration runner');
-      return mod.makeEnvCalendarRunIntegration({ env });
+      // Thread the owner's working hours + timezone so an inferred read window
+      // (bare "tomorrow", "evening") stays within working hours on the live
+      // free/busy query too, not just at slot selection.
+      return mod.makeEnvCalendarRunIntegration({
+        env,
+        workingHours: ownerWorkingHours(opts),
+        timezone: effectiveTimezone(opts),
+      });
     }
     if (tool.startsWith('email.')) {
       if ((process.env.PA_GMAIL_MCP_CMD ?? '').trim() === '') {
@@ -3271,7 +3817,7 @@ export function delegatedFileMedia(file: FileArtifact): Record<string, unknown> 
   };
 }
 
-function delegatedMediaReply(media: Record<string, unknown>): string {
+export function delegatedMediaReply(media: Record<string, unknown>): string {
   const url = typeof media.url === 'string' ? media.url : '';
   const mimeType = typeof media.mimeType === 'string' ? media.mimeType : '';
   if (!url) return 'The specialist created a file, but I could not build a display URL for it.';

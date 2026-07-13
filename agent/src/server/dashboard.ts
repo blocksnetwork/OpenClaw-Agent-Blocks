@@ -14,6 +14,8 @@
  *                                    return the transcript (mic → prompt)
  *       POST /api/describe-image   → hire an image-to-text (vision) agent on
  *                                    Blocks and return the description (image → prompt)
+ *       POST /api/generate-image   → hire a text-to-image agent on Blocks and
+ *                                    return the rendered picture (prompt → image)
  *       POST /api/skill-file       → create a downloadable SKILL.md artifact
  *       POST /api/route            → deterministic intent routing: if the user's
  *                                    text matches a specialist (e.g. LinkedIn tone
@@ -71,7 +73,11 @@ import {
 import { loadRootEnv } from '../env.ts';
 import { runSkill } from '../blocks/openclaw-client.ts';
 import { tagForRequest } from '../routing/intent-tags.ts';
-import { classifyTurn } from '../routing/turn-router.ts';
+import {
+  classifyRequest,
+  type ClassifyContext,
+  type ClassifyLogEntry,
+} from '../routing/classify.ts';
 import { probePeerReachable, probeStatusLabel, type PeerLiveness } from '../a2a/a2a-transport.ts';
 import { connect, agentEntryToDiscovered, walkRegistryPages, catalogScanMax } from '../blocks/blocks-client.ts';
 import {
@@ -84,12 +90,16 @@ import {
   formatSearchReply,
   formatCategorizeReply,
   loadCatalogSnapshot,
+  loadRuntimeCatalog,
+  browseCatalog,
+  BROWSE_DEFAULT_LIMIT,
+  BROWSE_MAX_LIMIT,
   type CatalogAgent,
 } from '../blocks/catalog-index.ts';
 import { fanout } from '../pipeline/fanout.ts';
 import { serveAgent, type AgentInstanceHandle, type HandlerFn } from '../blocks/blocks-serve.ts';
 import { resolveAgentBlocksCredential } from '../blocks/agent-keyring.ts';
-import type { DiscoveredAgent } from '../types.ts';
+import type { DiscoveredAgent, ArtifactOut, FileArtifact, CallResult } from '../types.ts';
 import { createAssistant, AssistantNameConflictError } from '../assistant/assistant-factory.ts';
 import {
   addPeer,
@@ -114,15 +124,21 @@ import { loadOwnerProfile, saveOwnerProfile } from '../assistant/owner-profile.t
 import { loadContacts, saveContact, removeContact, upsertPeerContact } from '../assistant/contacts-store.ts';
 import {
   buildMultiTenantAssistantRoute,
+  chooseSpecialist,
   configuredOwnerIds,
+  delegatedFileMedia,
+  delegatedMediaReply,
   multiTenantStateBaseDir,
   ownerStateKey,
   runAssistant,
   runMultiTenantAssistant,
+  respondToMeetingRequest,
+  listOwnerMeetingRequests,
   selfHandleForOwner,
   type MultiTenantAssistantOpts,
   type RunAssistantOpts,
 } from '../assistant/assistant-runtime.ts';
+import { buildNotification, type MeetingRequestNotification } from '../a2a/meeting-request.ts';
 import {
   buildGoogleOAuthStart,
   completeGoogleOAuth,
@@ -192,6 +208,36 @@ const MIN_TRANSCRIBE_BASE64_CHARS = 8_000;
  *  understanding (image → text). */
 const IMAGE_DESCRIBE_TAG = process.env.IMAGE_DESCRIBE_SKILL_TAG ?? 'image-to-text';
 
+/** Blocks skill tag the chat UI routes image-CREATION turns through
+ *  (text → image). The deterministic sibling of IMAGE_DESCRIBE_TAG. */
+const IMAGE_GENERATE_TAG = process.env.IMAGE_GENERATE_SKILL_TAG ?? 'text-to-image';
+
+/** Image generation is slow (a real diffusion/render call), so bound the
+ *  hire with a generous timeout rather than the transport default. */
+const IMAGE_GENERATE_TIMEOUT_MS = 120_000;
+
+/** How many candidate agents the multi-agent strategies (race/compare/best)
+ *  will hire at once. Bounds spend + latency when many image agents match. */
+const IMAGE_FANOUT_LIMIT = 6;
+
+/** Coordination strategy for an image-CREATION turn when MORE THAN ONE
+ *  text-to-image agent is discovered:
+ *   - 'single'  → pick the single best-ranked agent (chooseSpecialist); the
+ *                 cheapest, fastest default (one hire).
+ *   - 'race'    → hire everyone, first successful image wins, rest abandoned.
+ *   - 'compare' → hire everyone, return every image side by side.
+ *   - 'best'    → hire everyone, a local OpenClaw judge picks the winner.
+ *  Maps onto the existing fanout() modes ('compare' → 'all'). */
+const IMAGE_STRATEGIES = ['single', 'race', 'compare', 'best'] as const;
+type ImageStrategy = (typeof IMAGE_STRATEGIES)[number];
+
+function normalizeImageStrategy(raw: string | undefined): ImageStrategy {
+  const value = (raw ?? 'single').toLowerCase();
+  return (IMAGE_STRATEGIES as readonly string[]).includes(value)
+    ? (value as ImageStrategy)
+    : 'single';
+}
+
 interface ServedEntry {
   handle: AgentInstanceHandle;
   dir: string;
@@ -200,6 +246,44 @@ interface ServedEntry {
 
 /** Live agent instances served by this dashboard process. */
 const served = new Map<string, ServedEntry>();
+
+/* ── owner-scoped notification channel (the meeting-request handshake) ────
+ * Existing SSE (`/api/assistant/stream`) is per-REQUEST — it can only push to
+ * the owner who made that call. The two-sided handshake needs to push to the
+ * PEER owner too, so this adds an owner-keyed SSE fan-out. It reuses the same
+ * SSE framing as the stream endpoint rather than forking a new transport. */
+const ownerChannels = new Map<string, Set<ServerResponse>>();
+
+function subscribeOwnerChannel(ownerId: string, res: ServerResponse): () => void {
+  let set = ownerChannels.get(ownerId);
+  if (!set) {
+    set = new Set();
+    ownerChannels.set(ownerId, set);
+  }
+  set.add(res);
+  return () => {
+    const current = ownerChannels.get(ownerId);
+    if (!current) return;
+    current.delete(res);
+    if (current.size === 0) ownerChannels.delete(ownerId);
+  };
+}
+
+/** Fan one owner-scoped notification out to that owner's live channels. The
+ *  notification is ALREADY scoped to its recipient (`toOwnerId`) and carries
+ *  only policy-shared fields, so this is a pure transport step. */
+function pushOwnerNotification(notification: MeetingRequestNotification): void {
+  const channels = ownerChannels.get(notification.toOwnerId);
+  if (!channels || channels.size === 0) return;
+  const frame = `event: meeting-request\ndata: ${JSON.stringify({ ...notification, at: Date.now() })}\n\n`;
+  for (const res of channels) {
+    try {
+      res.write(frame);
+    } catch {
+      // A dead socket is cleaned up on its own 'close' handler.
+    }
+  }
+}
 
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://${host}:${port}`);
@@ -243,6 +327,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, url: URL
       case 'GET /api/status': return json(res, status());
       case 'GET /api/identity': return json(res, await apiDashboardIdentity(req));
       case 'GET /api/blocks': return json(res, await blocksCatalog(url));
+      case 'GET /api/blocks/browse': return json(res, await apiBlocksBrowse(url));
       case 'GET /api/openclaw': return json(res, await openClawCatalog());
       case 'GET /api/local-published': return json(res, await localPublishedAgents());
       case 'GET /api/served': return json(res, servedList());
@@ -263,6 +348,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, url: URL
       case 'POST /api/assistant/revoke': return json(res, await apiAssistantRevoke(req, await readBody(req)));
       case 'POST /api/assistant/run': return json(res, await apiAssistantRun(req, await readBody(req)));
       case 'POST /api/assistant/stream': return await apiAssistantStream(req, res);
+      case 'GET /api/assistant/notifications': return await apiAssistantNotifications(req, res, url);
+      case 'POST /api/assistant/meeting-request/accept': return json(res, await apiMeetingRequestRespond(req, await readBody(req), 'accept'));
+      case 'POST /api/assistant/meeting-request/decline': return json(res, await apiMeetingRequestRespond(req, await readBody(req), 'decline'));
       case 'GET /api/assistant/peers': return json(res, await apiAssistantPeers(req, url));
       case 'GET /api/assistant/peer-status': return json(res, await apiAssistantPeerStatus(req, url));
       case 'GET /api/assistant/overview': return json(res, await apiAssistantOverview(req));
@@ -270,9 +358,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, url: URL
       case 'POST /api/stop': return json(res, await apiStop(await readBody(req)));
       case 'POST /api/transcribe': return json(res, await apiTranscribe(await readBody(req, 32_000_000)));
       case 'POST /api/describe-image': return json(res, await apiDescribeImage(await readBody(req, 32_000_000)));
+      case 'POST /api/generate-image': return json(res, await apiGenerateImage(await readBody(req)));
       case 'POST /api/skill-file': return json(res, await apiSkillFile(await readBody(req)));
       case 'POST /api/route': return json(res, await apiRoute(await readBody(req)));
-      case 'POST /api/classify': return json(res, apiClassify(await readBody(req)));
+      case 'POST /api/classify': return json(res, await apiClassify(await readBody(req)));
       default: break;
     }
 
@@ -792,6 +881,89 @@ async function apiAssistantStream(req: IncomingMessage, res: ServerResponse) {
   }
 }
 
+/**
+ * Owner-scoped notification stream (SSE). Keyed by ownerId, this is how a
+ * PEER owner's dashboard learns "Incoming meeting request from Alice" and the
+ * initiator learns "Waiting for Bob to accept". On connect it replays the
+ * owner's current pending/terminal meeting requests so a freshly-opened tab is
+ * never blind to an in-flight handshake, then streams live updates.
+ */
+async function apiAssistantNotifications(req: IncomingMessage, res: ServerResponse, url: URL) {
+  requirePersonalAssistantsEnabled();
+  const ownerId = ownerFromQuery(req, url, 'owner');
+
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+    'access-control-allow-origin': CORS_ORIGIN,
+  });
+  res.write(`event: ready\ndata: ${JSON.stringify({ ownerId, at: Date.now() })}\n\n`);
+
+  const unsubscribe = subscribeOwnerChannel(ownerId, res);
+
+  // Replay the owner's current meeting requests (newest state per thread).
+  try {
+    const records = await listOwnerMeetingRequests(ownerId, dashboardMultiTenantOpts());
+    for (const record of records) {
+      res.write(`event: meeting-request\ndata: ${JSON.stringify({ ...buildNotification(record, ownerId, replayEvent(record.status)), replay: true, at: Date.now() })}\n\n`);
+    }
+  } catch (err) {
+    tnote(`notifications replay failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Heartbeat so proxies don't idle-close the stream.
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`event: ping\ndata: ${Date.now()}\n\n`);
+    } catch {
+      // handled on 'close'
+    }
+  }, 25_000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+    res.end();
+  });
+}
+
+function replayEvent(status: string): MeetingRequestNotification['event'] {
+  switch (status) {
+    case 'both-accepted': return 'both-accepted';
+    case 'committed': return 'committed';
+    case 'declined': return 'declined';
+    case 'expired': return 'expired';
+    case 'commit-failed': return 'commit-failed';
+    default: return 'proposed';
+  }
+}
+
+/**
+ * Accept/decline endpoint — reuses the PAIRED confirm-token pattern (one token
+ * per owner per threadId). Records the owner's response idempotently; on the
+ * SECOND acceptance the bilateral commit runs (both calendars, exactly once)
+ * and every resulting owner-scoped notification is fanned out to both parties.
+ */
+async function apiMeetingRequestRespond(req: IncomingMessage, body: Record<string, unknown>, decision: 'accept' | 'decline') {
+  requirePersonalAssistantsEnabled();
+  const ownerId = ownerFromBody(req, body, 'ownerId');
+  const threadId = requireString(body, 'threadId');
+  const confirmToken = optionalString(body, 'confirmToken');
+  tstep(`assistant.meeting-request.${decision} owner="${ownerId}" thread="${threadId}"`);
+
+  const result = await respondToMeetingRequest(
+    { threadId, ownerId, decision, ...(confirmToken ? { confirmToken } : {}) },
+    dashboardMultiTenantOpts(),
+  );
+  if (!result.ok) return { ok: false, action: 'meeting-request', decision, error: result.error };
+
+  for (const notification of result.notifications) pushOwnerNotification(notification);
+  tnote(`→ meeting-request ${result.record?.status}`);
+  return { ok: true, action: 'meeting-request', decision, record: result.record };
+}
+
 async function apiAssistantPeers(req: IncomingMessage, url: URL) {
   requirePersonalAssistantsEnabled();
   const ownerId = ownerFromQuery(req, url, 'owner', { optionalWhenUnauthenticated: true });
@@ -1264,6 +1436,14 @@ const dashboardLocalA2A: NonNullable<RunAssistantOpts['localA2A']> = async (peer
     throw new Error(`owner ${peerOwnerId} resolves to ${route.opts.selfHandle ?? 'unknown'}, not ${peer.agentName}`);
   }
 
+  // Owner attribution (bug fix): the task's `ownerId` is the CALLER's id — it
+  // MUST be, because the inbound invite gate (`authorizeInvited`) authenticates
+  // the caller by ownerId. But the request is being SERVED by the peer, whose
+  // bound owner is `route.policy.ownerId` (== peerOwnerId). Any peer-directed
+  // notification (the meeting-request handshake) therefore keys on
+  // `route.policy.ownerId`, NEVER on `task.ownerId` — otherwise an "Incoming
+  // meeting request" would be delivered back to the caller instead of the
+  // peer. The runtime honours this by scoping notifications to `policy.ownerId`.
   const task = {
     type: 'StartTask',
     taskId: `local-a2a-${Date.now()}`,
@@ -1290,6 +1470,10 @@ function dashboardMultiTenantOpts(): MultiTenantAssistantOpts {
     contactsStoreBaseDir: dashboardContactsStoreBaseDir(),
     runAssistantDefaults: {
       localA2A: dashboardLocalA2A,
+      // Owner-scoped notification transport for the two-sided handshake. The
+      // runtime hands each notification already scoped to its recipient
+      // (`toOwnerId`) and share-policy filtered; this just fans it out.
+      onOwnerNotify: (notification) => pushOwnerNotification(notification),
     },
   };
 }
@@ -1658,6 +1842,291 @@ function extractDescription(data: unknown): string {
   throw new HttpError(502, `image agent returned no text: ${JSON.stringify(data).slice(0, 200)}`);
 }
 
+/** Text → image: hire a text-to-image agent on Blocks and return the
+ *  generated picture. The chat UI posts an image-creation prompt here; we
+ *  discover a text-to-image agent by skill tag, rank the candidates with the
+ *  SAME `chooseSpecialist` logic the personal-assistant path uses, call the
+ *  winner like any other Blocks agent, and hand back the rendered artifact
+ *  (URL/bytes). This is the deterministic sibling of apiDescribeImage — it
+ *  makes image creation reach Blocks without depending on the gateway model
+ *  choosing to run the blocks_network skill.
+ *
+ *  Selection stays tag-discovery + ranking (NO hardcoded `openclaw_*` handle)
+ *  so third-party / user image agents are hired identically. Billing/consent:
+ *  defaults to `free` and never silently hires a paid agent — online discovery
+ *  already returns free-only, and this also guards any future paid listing. */
+async function apiGenerateImage(body: Record<string, unknown>) {
+  const prompt = requireString(body, 'prompt');
+  const billingMode = optionalString(body, 'billingMode') === 'paid' ? 'paid' : 'free';
+  const strategy = normalizeImageStrategy(optionalString(body, 'strategy'));
+  requireKeyWhenOnline('Image generation');
+  tstep(
+    `generate image (billing=${billingMode}, strategy=${strategy}) via skill "${IMAGE_GENERATE_TAG}"`
+      + ` · prompt=${previewValue(prompt)}`,
+  );
+
+  // Phase 1 — discover + billing gate on one short-lived session. The
+  // billing filter must run BEFORE any hire (single or multi) so a paid
+  // agent is never called silently; the surviving handles are then passed
+  // to the chosen strategy.
+  const discoverPartials: PartialEvent[] = [];
+  const session = await connect({ latencyScale: 0, onPartial: tracingPartial(discoverPartials) });
+  let affordable: DiscoveredAgent[];
+  try {
+    const pool = await session.discover(IMAGE_GENERATE_TAG);
+    tnote(`discover("${IMAGE_GENERATE_TAG}") → ${pool.length} image generator(s)`);
+    if (pool.length === 0) {
+      throw new HttpError(
+        404,
+        `no text-to-image agent on the network for skill "${IMAGE_GENERATE_TAG}" — serve one first (e.g. blocks serve openclaw_poster_maker)`,
+      );
+    }
+
+    // Billing/consent gate. Offline is the no-key mock (no real spend), so it
+    // hires whatever the mock catalog offers. Online, we never hire a paid
+    // agent unless the caller opted in — surface the choice instead of
+    // silently spending. (Online discovery is already free-only; this is the
+    // belt-and-braces guard so a future paid listing can't slip through.)
+    const offline = process.env.FOUNDATION_OFFLINE !== '0';
+    affordable = offline || billingMode === 'paid' ? pool : pool.filter(isFreeDiscoveredAgent);
+    if (affordable.length === 0) {
+      tnote('only paid text-to-image agents available; not hiring silently (billingMode=free)');
+      return {
+        ok: true,
+        action: 'generate-image',
+        matched: false as const,
+        billingMode,
+        strategy,
+        reason: 'Only paid text-to-image agents are available on Blocks right now. Re-run with billingMode "paid" to hire one.',
+      };
+    }
+
+    // Single (the default) OR only one candidate: keep the exact one-hire
+    // path — cheapest, fastest, no fan-out. Runs on this same session so the
+    // common case opens just one connection.
+    if (strategy === 'single' || affordable.length === 1) {
+      return await generateImageSingle(session, prompt, affordable, billingMode, strategy, discoverPartials);
+    }
+  } finally {
+    session.close();
+  }
+
+  // Phase 2 — MULTI-AGENT: more than one affordable agent AND the caller
+  // asked to race/compare/judge them. fanout() opens its own session (the
+  // one door), so the discovery session above is already closed.
+  return await generateImageMulti(prompt, affordable, strategy, billingMode);
+}
+
+/** One-hire path: rank with chooseSpecialist and call the single winner.
+ *  Identical behaviour to the original generate-image handler. */
+async function generateImageSingle(
+  session: Awaited<ReturnType<typeof connect>>,
+  prompt: string,
+  affordable: DiscoveredAgent[],
+  billingMode: 'free' | 'paid',
+  strategy: ImageStrategy,
+  partials: PartialEvent[],
+) {
+  const chosen = chooseSpecialist(affordable, IMAGE_GENERATE_TAG, prompt);
+  if (!chosen) {
+    throw new HttpError(404, `no callable text-to-image agent for skill "${IMAGE_GENERATE_TAG}"`);
+  }
+  const agent = affordable.find((a) => a.handle === chosen.handle) ?? affordable[0];
+
+  const result = await withTimeout(
+    session.call(agent.handle, IMAGE_GENERATE_TAG, { text: prompt }),
+    IMAGE_GENERATE_TIMEOUT_MS,
+    `${agent.handle} timed out after ${Math.round(IMAGE_GENERATE_TIMEOUT_MS / 1000)}s`,
+  );
+
+  // The image IS the answer, so surface the saved file artifact. Never
+  // fabricate one: if the agent came back without an image, fail honestly
+  // and let the caller fall back to the gateway.
+  const media = imageMediaOf(result);
+  if (media.length === 0) {
+    throw new HttpError(502, `text-to-image agent "${agent.handle}" returned no image artifact`);
+  }
+  const primary = media[0];
+  const text = delegatedMediaReply(primary);
+  const agentBilling = agent.billingMode ?? (Number(agent.price.amount) > 0 ? 'paid' : 'free');
+  tnote(`→ ${agent.handle} rendered ${String(primary.mimeType ?? 'image')} · ${result.meta.latencyMs}ms · $${result.meta.costUsd.toFixed(3)}`);
+  return {
+    ok: true,
+    action: 'generate-image',
+    matched: true as const,
+    strategy: 'single' as const,
+    text,
+    handle: agent.handle,
+    displayName: agent.displayName,
+    whyMatched: chosen.whyMatched,
+    billingMode: agentBilling,
+    media: primary,
+    artifacts: media,
+    meta: result.meta,
+    partials,
+  };
+}
+
+/** Multi-hire path: fan out across every affordable agent with the chosen
+ *  coordination strategy, then return one gallery (compare) or the winner
+ *  (race/best) — each result labelled with its agent, latency + cost. */
+async function generateImageMulti(
+  prompt: string,
+  affordable: DiscoveredAgent[],
+  strategy: Exclude<ImageStrategy, 'single'>,
+  billingMode: 'free' | 'paid',
+) {
+  const mode = strategy === 'compare' ? 'all' : strategy; // 'race' | 'all' | 'best'
+  const handles = affordable.map((a) => a.handle);
+  const partials: PartialEvent[] = [];
+  tnote(`${strategy} across ${handles.length} image agent(s): ${handles.join(', ')}`);
+
+  const fan = await fanout({
+    skill: IMAGE_GENERATE_TAG,
+    handles,
+    inputs: { text: prompt },
+    mode,
+    limit: IMAGE_FANOUT_LIMIT,
+    tries: 1,
+    timeoutMs: IMAGE_GENERATE_TIMEOUT_MS,
+    latencyScale: 0,
+    onPartial: tracingPartial(partials),
+  });
+
+  // Keep only successes that actually returned an image — never fabricate.
+  const winnerHandle = fan.verdict?.winner;
+  let entries = fan.results
+    .map((result) => ({ result, media: imageMediaOf(result) }))
+    .filter((e) => e.media.length > 0)
+    .map((e) => ({
+      ...e,
+      winner: strategy === 'best' ? e.result.meta.handle === winnerHandle : false,
+    }));
+
+  if (entries.length === 0) {
+    const why = fan.failures.map((f) => `${f.handle}: ${f.reason}`).join('; ') || 'no image artifact returned';
+    throw new HttpError(502, `no text-to-image agent produced an image (${why})`);
+  }
+
+  // Put the winner first for race/best so the primary artifact is the winner.
+  if (strategy === 'best' && winnerHandle) {
+    entries = [...entries].sort((a, b) => Number(b.winner) - Number(a.winner));
+  }
+
+  const results = entries.map((e) => ({
+    handle: e.result.meta.handle,
+    displayName: e.result.meta.displayName || e.result.meta.handle,
+    media: e.media[0],
+    artifacts: e.media,
+    meta: e.result.meta,
+    winner: e.winner,
+  }));
+  const primary = results[0];
+  const text = renderImageGallery(entries, {
+    strategy,
+    verdict: fan.verdict,
+    abandoned: fan.abandoned,
+    failures: fan.failures,
+  });
+
+  for (const r of results) {
+    tnote(`✓ ${r.handle}${r.winner ? ' (winner)' : ''} → ${r.meta.latencyMs}ms · $${r.meta.costUsd.toFixed(3)}`);
+  }
+  for (const f of fan.failures) tnote(`✗ ${f.handle} failed: ${f.reason}`);
+  for (const h of fan.abandoned ?? []) tnote(`○ ${h} abandoned (${strategy} already resolved)`);
+  if (fan.verdict) tnote(`judge → winner ${fan.verdict.winner}: ${fan.verdict.reason}`);
+
+  return {
+    ok: true,
+    action: 'generate-image',
+    matched: true as const,
+    strategy,
+    text,
+    handle: primary.handle,
+    displayName: primary.displayName,
+    whyMatched: strategyWhy(strategy, results.length),
+    billingMode,
+    media: primary.media,
+    artifacts: primary.artifacts,
+    meta: primary.meta,
+    results,
+    abandoned: fan.abandoned,
+    failures: fan.failures,
+    verdict: fan.verdict,
+    partials,
+  };
+}
+
+/** Extract the image file artifacts from a call result as chat media
+ *  descriptors. Empty when the agent returned no image. */
+function imageMediaOf(result: CallResult): ReturnType<typeof delegatedFileMedia>[] {
+  const arts: ArtifactOut[] = result.artifacts ?? [{ kind: 'data', data: result.data, mimeType: 'application/json' }];
+  const files = arts.filter((a): a is FileArtifact => a.kind === 'file' && a.mimeType.startsWith('image/'));
+  return files.map((file) => delegatedFileMedia(file));
+}
+
+function strategyWhy(strategy: Exclude<ImageStrategy, 'single'>, count: number): string {
+  switch (strategy) {
+    case 'race': return `raced ${count} image agents — first success won`;
+    case 'compare': return `compared ${count} image agents side by side`;
+    case 'best': return `judged the best of ${count} image agents`;
+  }
+}
+
+/** Build the chat reply for a multi-agent image turn: a labelled gallery
+ *  (agent · latency · cost) rendered as Markdown so it flows through the
+ *  existing renderer with no new UI plumbing. */
+function renderImageGallery(
+  entries: Array<{ result: CallResult; media: ReturnType<typeof delegatedFileMedia>[]; winner: boolean }>,
+  opts: {
+    strategy: Exclude<ImageStrategy, 'single'>;
+    verdict?: { winner: string; reason: string };
+    abandoned?: string[];
+    failures: Array<{ handle: string; reason: string }>;
+  },
+): string {
+  const { strategy, verdict, abandoned, failures } = opts;
+  const lines: string[] = [];
+
+  if (strategy === 'compare') {
+    lines.push(`**Compared ${entries.length} image agent${entries.length === 1 ? '' : 's'} on Blocks**`, '');
+  } else if (strategy === 'best') {
+    lines.push(`**Best of ${entries.length} on Blocks** — judged locally`, '');
+  } else {
+    // Race surfaces only the winner, so count the whole field for the header.
+    const raced = entries.length + (abandoned?.length ?? 0) + failures.length;
+    lines.push(`**Fastest of ${raced} raced on Blocks**`, '');
+  }
+
+  for (const e of entries) {
+    const name = e.result.meta.displayName || e.result.meta.handle;
+    const secs = (e.result.meta.latencyMs / 1000).toFixed(1);
+    const cost = e.result.meta.costUsd.toFixed(3);
+    const flag = e.winner ? '✓ ' : '';
+    lines.push(`${flag}**${name}** · ${secs}s · $${cost}`);
+    lines.push(delegatedMediaReply(e.media[0]));
+    lines.push('');
+  }
+
+  if (strategy === 'best' && verdict) {
+    lines.push(`_Judge picked **${verdict.winner}**: ${verdict.reason}_`);
+  } else if (strategy === 'race' && abandoned?.length) {
+    lines.push(`_${abandoned.join(', ')} abandoned once the first image landed._`);
+  }
+  if (failures.length) {
+    lines.push(`_${failures.length} agent${failures.length === 1 ? '' : 's'} failed: ${failures.map((f) => f.handle).join(', ')}._`);
+  }
+
+  return lines.join('\n').trim();
+}
+
+/** A discovered agent is "free" when it neither advertises a paid billing
+ *  tier nor a non-zero price. Mirrors the free-preference used by the random
+ *  Blocks agent route. */
+function isFreeDiscoveredAgent(agent: DiscoveredAgent): boolean {
+  return (agent.billingMode ?? 'free') !== 'paid' && Number(agent.price.amount) === 0;
+}
+
 // ── deterministic intent routing ─────────────────────────────────────────
 // Some requests map cleanly onto a Blocks specialist. Rather than hope the
 // gateway model chooses to delegate (it often doesn't — it prefers its own
@@ -1694,12 +2163,50 @@ const INTENT_ROUTES: IntentRoute[] = [
 const RANDOM_AGENT_TIMEOUT_MS = 20_000;
 const SELECTED_AGENT_TIMEOUT_MS = 120_000;
 
-/** Phase 3: the single authoritative "which path does this turn take?" gate.
- *  The chat surface posts the turn text and dispatches on `route` instead of
- *  running its own `looksPersonalAssistant` / `looksRoutable` regexes. */
-function apiClassify(body: Record<string, unknown>) {
+/** §6: the ONE model-assisted "which path does this turn take?" gate. Returns a
+ *  VALIDATED structured intent from the closed taxonomy (`intent-tags.ts`): a
+ *  strong model handles ambiguous phrasing while the deterministic mirror
+ *  guarantees a safe, logged fallback (never a silent gateway drop, never a
+ *  fabricated route). Backward-compatible: the client still reads `data.route`;
+ *  the structured fields (intent/tag/personRef/slots/confidence/source) enrich it. */
+async function apiClassify(body: Record<string, unknown>) {
   const text = optionalString(body, 'text') ?? '';
-  return { ok: true as const, ...classifyTurn(text) };
+  const context = readClassifyContext(body);
+  const result = await classifyRequest(text, context, {
+    runSkillImpl: runSkill,
+    log: logClassifyDecision,
+  });
+  return { ok: true as const, ...result };
+}
+
+/** Parse the optional lightweight session context. Only fields already in scope
+ *  for the turn are read; nothing here leaks owner data beyond the request. */
+function readClassifyContext(body: Record<string, unknown>): ClassifyContext {
+  const raw = body.context;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {};
+  const ctx = raw as Record<string, unknown>;
+  const out: ClassifyContext = {};
+  if (ctx.hasAttachedImage === true) out.hasAttachedImage = true;
+  if (ctx.hasAttachedAudio === true) out.hasAttachedAudio = true;
+  if (typeof ctx.selectedBlocksAgent === 'string' && ctx.selectedBlocksAgent.trim()) {
+    out.selectedBlocksAgent = ctx.selectedBlocksAgent.trim();
+  }
+  if (Array.isArray(ctx.rosterPeers)) {
+    out.rosterPeers = ctx.rosterPeers.filter((p): p is string => typeof p === 'string');
+  }
+  if (Array.isArray(ctx.recentTurns)) {
+    out.recentTurns = ctx.recentTurns.filter((p): p is string => typeof p === 'string');
+  }
+  return out;
+}
+
+/** Observability: log every routing decision (input → intent → route → source →
+ *  confidence) so misroutes are debuggable rather than invisible. */
+function logClassifyDecision(entry: ClassifyLogEntry): void {
+  const detail = entry.detail ? ` (${entry.detail})` : '';
+  console.log(
+    `[classify] route=${entry.route} intent=${entry.intent} source=${entry.source} confidence=${entry.confidence}${detail} :: ${entry.text.slice(0, 120)}`,
+  );
 }
 
 async function apiSkillFile(body: Record<string, unknown>) {
@@ -1987,6 +2494,14 @@ function selectedAgentFailureReason(errors: string[]): string {
  * single-flight so concurrent chat turns don't stampede.
  */
 async function loadDashboardCatalog(refresh = false): Promise<{ agents: CatalogAgent[]; scanned: number; totalCount?: number; truncated: boolean }> {
+  // Offline parity: with FOUNDATION_OFFLINE the registry walk can't reach the
+  // network (blocksBaseUrl() → fetchCdmConfig, then fetchAgentRegistry both need
+  // it), so serve the SAME mock catalog the runtime uses — through the shared
+  // cached scan path (loadRuntimeCatalog → scanCatalog), not a second one. This
+  // keeps CI/offline checks and the loopback demo working with no key.
+  if (process.env.FOUNDATION_OFFLINE !== '0') {
+    return loadRuntimeCatalog(true, { refresh });
+  }
   const baseUrl = await blocksBaseUrl();
   return loadCatalogSnapshot(
     `dashboard:${baseUrl}`,
@@ -2140,6 +2655,32 @@ function requireKeyWhenOnline(action: string) {
 }
 
 // ── catalog endpoints (read-only) ───────────────────────────────────────
+
+/**
+ * Paginated, searchable view of the WHOLE public registry for the always-on
+ * "Browse all network agents" panel.
+ *
+ * Unlike `GET /api/blocks` (a single SDK page that silently misses agents past
+ * `limit`), this is backed by `loadDashboardCatalog()` — the full cursor walk
+ * with a 60s cache — so it browses the entire scanned catalog. `q`/`tag` and
+ * the page slice are applied by the shared `browseCatalog` helper (which reuses
+ * the ONE ranking pipeline), and `scanned`/`totalCount`/`truncated` are
+ * surfaced so the panel is honest about how much of the network it can see.
+ * The 60s TTL protects the backend from a page-per-scroll stampede; `refresh=1`
+ * forces a fresh walk.
+ */
+async function apiBlocksBrowse(url: URL) {
+  const offset = clampInt(url.searchParams.get('offset') ?? undefined, 0, 100_000, 0);
+  const limit = clampInt(url.searchParams.get('limit') ?? undefined, 1, BROWSE_MAX_LIMIT, BROWSE_DEFAULT_LIMIT);
+  const q = url.searchParams.get('q')?.trim() ?? '';
+  const tag = url.searchParams.get('tag')?.trim() ?? '';
+  const refreshParam = url.searchParams.get('refresh')?.trim();
+  const refresh = refreshParam === '1' || refreshParam === 'true';
+
+  const snapshot = await loadDashboardCatalog(refresh);
+  const browsed = browseCatalog(snapshot, { offset, limit, q, tag });
+  return { ok: true, ...browsed };
+}
 
 async function blocksCatalog(url: URL) {
   const tag = url.searchParams.get('tag')?.trim();

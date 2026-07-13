@@ -157,6 +157,23 @@ export const MOCK_CATALOG: MockListing[] = [
     }),
   },
   {
+    // A SECOND free text-to-image generator so the multi-agent image
+    // strategies (race / compare / best) are provable offline: discover
+    // returns two, and this one is deliberately slower (900ms vs 600ms) so a
+    // 'race' has a deterministic winner. Free, so it survives the billing
+    // gate even when the caller asks for free-only.
+    handle: 'blk_poster_forge',
+    displayName: 'Poster Forge',
+    provider: 'foundation-mocks',
+    skills: ['text-to-image', 'poster'],
+    description: 'Turns a text prompt into a bold poster image. A second text-to-image generator, free to hire.',
+    price: { amount: '0.000', currency: 'USD', unit: 'per_call' },
+    baseLatencyMs: 900,
+    handler: async () => ({
+      artifacts: [{ data: PIXEL_PNG, mimeType: 'image/png', fileName: 'poster.png' }],
+    }),
+  },
+  {
     // Offline stand-in for openclaw_transcriber: can't actually run STT
     // with no provider, so it returns a clearly-labelled canned transcript
     // — enough to exercise the mic → /api/transcribe → prompt path.

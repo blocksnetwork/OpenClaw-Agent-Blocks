@@ -150,6 +150,65 @@ try {
   );
   console.log('▸ planner repair: "coordinate with Bob / both free" cannot stop at local freeBusy ✓');
 
+  // Robust to PHRASING + slot-fills the under-specified case. The TERSE "find a
+  // time for me and Bob to meet" (no "coordinate", no duration, no window)
+  // must still trip the SAME repair — the shared detector is intent-shaped —
+  // and the runtime must default the duration to 30 minutes rather than
+  // dropping to a request for the raw ingredients.
+  let terseFreeBusyCalls = 0;
+  let terseA2A: { handle: string; intent: string } | undefined;
+  let terseA2AAttempts = 0;
+  const terseRepaired = payloadOf(
+    await runAssistant(
+      ownerTask('Find a time for me and Bob to meet.'),
+      undefined,
+      { ownerId: 'alice-oid' },
+      {
+        selfHandle: 'pa_alice',
+        rosterBaseDir: baseDir,
+        budgetBaseDir: baseDir,
+        auditBaseDir: baseDir,
+        runSkillImpl: async () => ({
+          ok: true,
+          reply: 'Let me check your calendar.',
+          actions: [{ kind: 'use-integration', tool: 'calendar.freeBusy', args: { query: 'Find a time for me and Bob to meet.' } }],
+        }),
+        runIntegration: async (tool) => {
+          if (tool === 'calendar.freeBusy') terseFreeBusyCalls += 1;
+          return { ok: true, tool, freeBusy: [], window: { timeMin: '2026-07-02T12:00:00', timeMax: '2026-07-02T17:00:00' } };
+        },
+        sendA2A: async (handle, request) => {
+          terseA2AAttempts += 1;
+          terseA2A = { handle, intent: request.intent };
+          if (terseA2AAttempts === 1) {
+            return { ok: true, a2a: true, offline: false, to: handle, intent: request.intent, artifacts: [] };
+          }
+          return {
+            ok: true,
+            a2a: true,
+            offline: true,
+            to: handle,
+            intent: request.intent,
+            reply: 'I checked my calendar and I look free for tomorrow afternoon.',
+            result: { ok: true, tool: 'calendar.freeBusy', freeBusy: [], window: { timeMin: '2026-07-02T12:00:00', timeMax: '2026-07-02T17:00:00' } },
+          };
+        },
+        offline: false,
+      },
+    ),
+  );
+  assert(terseFreeBusyCalls === 1, `terse phrasing repair must still check owner calendar once, got ${terseFreeBusyCalls}`);
+  assert(terseA2A?.handle === 'pa_bob', `terse phrasing must resolve "me and Bob" to Bob's peer assistant, got ${JSON.stringify(terseA2A)}`);
+  assert(terseRepaired.multiStep === true && Array.isArray(terseRepaired.actions) && terseRepaired.actions.length === 2, `terse phrasing must execute as a repaired 2-step plan, got ${JSON.stringify(terseRepaired)}`);
+  assert(
+    isRecord(terseRepaired.suggestedBooking) &&
+      terseRepaired.suggestedBooking.start === '2026-07-02T12:00:00' &&
+      terseRepaired.suggestedBooking.end === '2026-07-02T12:30:00' &&
+      terseRepaired.suggestedBooking.durationMinutes === 30,
+    `under-specified terse request must slot-fill a 30-minute suggested slot, got ${JSON.stringify(terseRepaired.suggestedBooking)}`,
+  );
+  console.log('▸ phrasing + slot-fill: terse "find a time for me and Bob to meet" repairs and defaults to a 30-minute slot ✓');
+
   let fallbackFreeBusyCalls = 0;
   let fallbackSendAttempts = 0;
   let localFallbackCalls = 0;

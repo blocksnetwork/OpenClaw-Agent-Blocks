@@ -4,7 +4,7 @@
    =========================================================================== */
 (function () {
   const { useState, useEffect, useRef, useCallback } = React;
-  const { Sidebar, Message, EmptyState, AssistantOverviewPanel, SettingsModal, Lightbox, Toast, Icons } = window;
+  const { Sidebar, Message, EmptyState, AssistantOverviewPanel, MeetingRequestsPanel, NetworkAgentsPanel, SettingsModal, Lightbox, Toast, Icons } = window;
 
   function deriveTitle(text, atts) {
     const t = (text || "").trim().replace(/\s+/g, " ");
@@ -668,6 +668,17 @@
       showToast(`${blocksAgentLabel(agent)} attached. Type a prompt and send.`);
     }, [showToast]);
 
+    // Same "attach to prompt" flow as the chat catalog cards, reused by the
+    // always-on Network agents browse panel (no source message to gate on).
+    const handleBrowseAgentUse = useCallback((agent) => {
+      const handle = blocksAgentHandle(agent);
+      if (!handle) return;
+      if (busyRef.current) { showToast("Let the current run finish first."); return; }
+      setSelectedBlocksAgent(agent);
+      setInject({ focusOnly: true, n: Date.now() });
+      showToast(`${blocksAgentLabel(agent)} attached. Type a prompt and send.`);
+    }, [showToast]);
+
     /* ----------------------------- send ------------------------------- */
     const send = useCallback(async ({ text, attachments, targetBlocksAgent }) => {
       if (streamRef.current || busyRef.current) return;
@@ -1042,19 +1053,121 @@
         }
       }
 
+      // Text → image: an image-CREATION turn (no attached image) is hired
+      // straight from a Blocks text-to-image agent FIRST — the deterministic
+      // sibling of the image-understanding step above — so "generate a logo" /
+      // "draw a picture" reliably reaches Blocks instead of the gateway's own
+      // model. On success the rendered picture IS the answer, so we
+      // short-circuit. On no-agent/failure we degrade gracefully to the
+      // gateway (never fabricate an image). Hard-bounded + cancelable.
+      let imageGenFellBack = false;
+      if (!images.length && window.createsImage(routeDecisionText)) {
+        const genId = "gen-" + asstId;
+        const genStrategy = (si && si.imageStrategy) || "single";
+        const genLabel = genStrategy === "race" ? "Racing image agents on Blocks…"
+          : genStrategy === "compare" ? "Comparing image agents on Blocks…"
+          : genStrategy === "best" ? "Picking the best image on Blocks…"
+          : "Creating your image on Blocks…";
+        updateAsst(convId, asstId, (m) => ({
+          ...m,
+          thinking: upsertThinkingStep(m.thinking || startThinking("Creating your image…"), {
+            id: genId,
+            label: genLabel,
+            detail: "text-to-image",
+            status: "running",
+          }),
+          toolEvents: mergeEvent(m.toolEvents, {
+            type: "tool", id: genId, skill: "text-to-image", status: "running",
+            label: genLabel,
+          }),
+        }));
+
+        const controller = new AbortController();
+        let timedOut = false;
+        const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 150000);
+        streamRef.current = { cancel: () => controller.abort() };
+
+        try {
+          const gen = await window.generateImage(routeDecisionText, si, controller.signal);
+          if (gen && gen.matched !== false && gen.text) {
+            const cost = gen.meta && gen.meta.costUsd;
+            const latency = gen.meta && gen.meta.latencyMs;
+            const nAgents = (gen.results && gen.results.length) || 1;
+            const madeBy = nAgents > 1
+              ? `${gen.strategy === "compare" ? "Compared" : gen.strategy === "best" ? "Best of" : "Fastest of"} ${nAgents} agents on Blocks`
+              : `Created by ${gen.handle} on Blocks`;
+            updateAsst(convId, asstId, (m) => ({
+              ...m,
+              text: gen.text,
+              thinking: finishThinking(m.thinking, madeBy),
+              toolEvents: (m.toolEvents || []).map((e) => e.id === genId
+                ? { ...e, status: "done", skill: gen.handle, label: madeBy } : e),
+              meta: {
+                ...(m.meta || {}),
+                handle: gen.handle,
+                generatedImage: gen.media,
+                billingMode: gen.billingMode,
+                ...(cost != null ? { cost } : {}),
+                ...(latency != null ? { latency } : {}),
+              },
+            }));
+            clearTimeout(timeout);
+            busyRef.current = false;
+            finishStream();
+            return;
+          }
+          // No text-to-image agent available (or a paid-only, consent-gated
+          // catalog) — drop the tentative step and let the gateway try.
+          imageGenFellBack = true;
+          updateAsst(convId, asstId, (m) => ({
+            ...m,
+            thinking: m.thinking ? {
+              ...m.thinking,
+              steps: (m.thinking.steps || []).filter((s) => s.id !== genId),
+            } : m.thinking,
+            toolEvents: (m.toolEvents || []).filter((e) => e.id !== genId),
+          }));
+        } catch (err) {
+          // Honest failure → fall back to the gateway rather than fabricating.
+          imageGenFellBack = true;
+          const why = timedOut
+            ? "Image generation timed out after 150s."
+            : String(err.message || err).replace(/\n/g, " ");
+          updateAsst(convId, asstId, (m) => ({
+            ...m,
+            thinking: upsertThinkingStep(m.thinking, {
+              id: genId,
+              label: "No Blocks image agent — using the gateway",
+              detail: why,
+              status: "done",
+            }),
+            toolEvents: (m.toolEvents || []).map((e) => e.id === genId
+              ? { ...e, status: "done", label: "No Blocks image agent — using the gateway" } : e),
+          }));
+        } finally {
+          clearTimeout(timeout);
+          streamRef.current = null;
+        }
+      }
+
       // Phase 3: ONE authoritative gate decides the path for this turn. An
       // attached image is always an assistant turn (Phase 2 made the PA own
       // image understanding); for everything else we ask the bridge
       // (/api/classify, the single source of truth in src/routing/turn-router.ts),
       // which transparently falls back to a local heuristic if unreachable.
-      // The client no longer owns this classification.
+      // The client no longer owns this classification. When the deterministic
+      // image-generation hook above already handled (and fell back from) an
+      // image-creation turn, go straight to the gateway — don't re-route it to
+      // the assistant path where it would try a second time.
       const routeCandidates = wantsRandomBlocksFollowup(routeDecisionText) ? lastBlocksCandidates(history) : [];
       const routeText = routeCandidates.length
         ? `Use a random Blocks agent from the previous catalog results. ${routeDecisionText}`
         : routeDecisionText;
       const turnRoute = imageDescriptions.length
         ? "assistant"
-        : await window.classifyTurn(routeText, si);
+        : imageGenFellBack
+          ? "gateway"
+          : await window.classifyTurn(routeText, si);
 
       // Personal-assistant demo path: calendar/Gmail/poster/A2A prompts
       // should hit the owner-scoped PA runtime directly. The generic gateway
@@ -1385,6 +1498,13 @@
           <div className="thread" ref={threadRef} onScroll={onThreadScroll}>
             <div className="thread-inner">
               <AssistantOverviewPanel settings={settings} />
+              <MeetingRequestsPanel settings={settings} />
+              <NetworkAgentsPanel
+                settings={settings}
+                selectedAgent={selectedBlocksAgent}
+                onUseAgent={handleBrowseAgentUse}
+                disabled={!!streamingId}
+              />
               {messages.length === 0 ? (
                 <EmptyState onPick={pickSuggestion} />
               ) : (

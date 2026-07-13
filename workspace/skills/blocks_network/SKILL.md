@@ -139,7 +139,46 @@ CRITICAL — how to run commands:
    description into the prompt as "Image understanding from Blocks". Use
    `describe` yourself when you need to (re-)analyze an image file on disk.
 
-8. Our own published agents (produce side):
+8. Generate an image — hire a text-to-image agent on the network to make a
+   NEW picture from a text prompt, then surface the rendered image:
+
+       sh /home/node/.openclaw/workspace/skills/blocks_network/scripts/blocks generate "a lighthouse at dawn, poster style"
+
+   It discovers a `text-to-image` agent, ranks the candidates, hires the
+   best handle (no hardcoded handle — third-party image agents are hired
+   identically), and returns
+   `{"ok":true,"text":"![…](<url>)","handle":"…","media":{…},"meta":{…}}`.
+   The `text` field is ready-to-embed Markdown for the image; also see the
+   file-artifact rules below. Defaults to `billingMode:"free"` so a paid
+   image agent is never hired silently — if only paid agents are available
+   the command returns `{"ok":true,"matched":false,"reason":"…"}`; re-run
+   with a `{"billingMode":"paid"}` body via `generate-json` to opt in.
+
+       echo '{"prompt":"a lighthouse at dawn","billingMode":"free"}' | sh /home/node/.openclaw/workspace/skills/blocks_network/scripts/blocks generate-json
+
+   When MORE THAN ONE text-to-image agent is discovered you can coordinate
+   them instead of hiring just the best-ranked one — pass `--strategy`
+   (`single` default | `race` | `compare` | `best`), the image equivalent of
+   the `race`/`best` fan-out above:
+
+       sh /home/node/.openclaw/workspace/skills/blocks_network/scripts/blocks generate --strategy compare "a lighthouse at dawn, poster style"
+
+   - `single` — hire the single best-ranked agent (cheapest, one hire).
+   - `race` — hire all, first image to land wins; adds `abandoned` handles.
+   - `compare` — hire all, return every image; adds a `results` array (one
+     entry per agent with its `media` + `meta`) and a gallery in `text`.
+   - `best` — hire all, a local judge picks the winner; adds `verdict` and
+     flags the winning `results` entry.
+   Only free agents are hired under `billingMode:"free"`, and the strategy
+   collapses to a single hire when just one image agent is available.
+
+   Note: the chat UI already routes image-CREATION turns ("generate a
+   logo", "draw a picture") through this same path automatically before the
+   turn reaches you, rendering the image inline (honoring the operator's
+   image-strategy setting). Use `generate` yourself when you need to create
+   an image from a script or a produced brief.
+
+9. Our own published agents (produce side):
 
        sh /home/node/.openclaw/workspace/skills/blocks_network/scripts/blocks served
        sh /home/node/.openclaw/workspace/skills/blocks_network/scripts/blocks serve openclaw_echo_normalizer
@@ -148,7 +187,7 @@ CRITICAL — how to run commands:
    `serve` puts a local agent on the public network (returns its
    `instanceId`); `stop` takes it off.
 
-9. Personal-assistant peer roster (private assistants that talk to each
+10. Personal-assistant peer roster (private assistants that talk to each
    other). Peer handles come from this roster, NOT from `discover`
    (private assistants are not discoverable):
 

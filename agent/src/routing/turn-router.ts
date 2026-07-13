@@ -17,6 +17,9 @@
  * exactly: assistant first, then specialist, else gateway.
  */
 
+import { createsImage, understandsImage } from './intent-tags.ts';
+import { looksPeerCoordination } from './peer-coordination.ts';
+
 export type TurnRoute = 'assistant' | 'specialist' | 'gateway';
 
 export interface TurnClassification {
@@ -25,12 +28,23 @@ export interface TurnClassification {
 }
 
 /** Private-assistant turn: an owner action on their own world (calendar, mail,
- *  peers, media) or a confirm/resume token from a chip. Mirrors the legacy
- *  client `looksPersonalAssistant` regex byte-for-byte. */
+ *  peers, media) or a confirm/resume token from a chip. Media intents (create
+ *  OR understand an image) defer to the ONE canonical `intent-tags` matcher
+ *  instead of a bare `poster|image` regex, so "generate a logo" / "draw a
+ *  picture" / "design an illustration" classify the same way here, in the
+ *  offline stub, and in the live brain table. Peer-coordination is likewise an
+ *  intent-shaped signal (`looksPeerCoordination` from the ONE shared detector)
+ *  rather than exact words, so the terse "find a time for me and Bob to meet"
+ *  reaches the PA just like the verbose "coordinate with Bob so we are both
+ *  free". Mirrors the client `looksPersonalAssistant` fallback in
+ *  `web/chat/js/lib.jsx` byte-for-byte. */
 function looksAssistant(t: string): boolean {
   return (
     /\bconfirm_[a-f0-9]{16}\b/iu.test(t) ||
-    /\b(availability|available|free|busy|calendar|schedule|meeting|book|draft an email|email|gmail|poster|image|ask .+ assistant)\b/iu.test(t)
+    /\b(availability|available|free|busy|calendar|schedule|meeting|book|draft an email|email|gmail|ask .+ assistant)\b/iu.test(t) ||
+    looksPeerCoordination(t) ||
+    createsImage(t) ||
+    understandsImage(t)
   );
 }
 

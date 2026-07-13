@@ -17,6 +17,7 @@ import { runSkill } from '../blocks/openclaw-client.ts';
 import { loadRootEnv } from '../env.ts';
 import { validatePlan } from '../assistant/plan-schema.ts';
 import { TAGS } from '../routing/intent-tags.ts';
+import { peerCoordinationPersonRef } from '../routing/peer-coordination.ts';
 
 loadRootEnv();
 process.env.FOUNDATION_OFFLINE = '1';
@@ -136,6 +137,47 @@ try {
     `second mutual availability step must call Bob by personRef, got ${JSON.stringify(mutualSteps[1])}`,
   );
   console.log('▸ stub: mutual availability with Bob → calendar.freeBusy + call-peer(Bob) ✓');
+
+  // Robust to PHRASING: the ONE shared detector (peer-coordination.ts) treats
+  // coordination as intent-shaped, not keyword-exact. The offline stub and the
+  // live-plan repair both import it, so proving it here proves both paths. The
+  // terse forms below used to fall through to the generic gateway / a bare
+  // local calendar read; they must now extract the right personRef and emit
+  // the SAME calendar.freeBusy + call-peer plan as the verbose phrasing.
+  const coordinationCases: Array<{ request: string; personRef: string }> = [
+    { request: 'Find a time for me and Bob to meet.', personRef: 'Bob' },
+    { request: 'set up 30 min with Sam', personRef: 'Sam' },
+    { request: 'when are Kayley and I both free Thursday?', personRef: 'Kayley' },
+    { request: 'find a slot that works for both me and Kayley', personRef: 'Kayley' },
+    { request: 'Coordinate with Bob to find a time we are both free tomorrow afternoon for a 30 minute meeting.', personRef: 'Bob' },
+  ];
+  for (const { request, personRef } of coordinationCases) {
+    // 1. the shared detector extracts the natural reference (never a handle).
+    assert(
+      peerCoordinationPersonRef(request) === personRef,
+      `shared detector must extract personRef "${personRef}" from "${request}", got ${JSON.stringify(peerCoordinationPersonRef(request))}`,
+    );
+    // 2. the offline stub turns it into the ordered freeBusy + call-peer plan.
+    const plan = (await runSkill('personal_assistant', { request })) as Envelope;
+    assert(Array.isArray(plan.steps), `"${request}" must emit ordered steps, got ${JSON.stringify(plan)}`);
+    const steps = plan.steps as Action[];
+    assert(
+      steps.length === 2 &&
+        steps[0].kind === 'use-integration' && steps[0].tool === 'calendar.freeBusy' &&
+        steps[1].kind === 'call-peer' && steps[1].personRef === personRef && steps[1].assistant === undefined,
+      `"${request}" must emit calendar.freeBusy + call-peer(${personRef}) with no fabricated handle, got ${JSON.stringify(steps)}`,
+    );
+  }
+  // Conservative: a direct booking the owner already timed is NOT coordination
+  // — it stays a single calendar.createEvent, never freeBusy + call-peer.
+  assert(peerCoordinationPersonRef('Book a 30 minute meeting with Sam on Friday at 2pm.') === null, 'an explicitly-timed direct booking must not be treated as coordination');
+  const directBooking = (await runSkill('personal_assistant', { request: 'Book a 30 minute meeting with Sam on Friday at 2pm.' })) as Envelope;
+  const directSteps = (directBooking.steps ?? directBooking.actions) as Action[];
+  assert(
+    Array.isArray(directSteps) && directSteps.length === 1 && directSteps[0].kind === 'use-integration' && directSteps[0].tool === 'calendar.createEvent',
+    `direct booking must stay a single calendar.createEvent, got ${JSON.stringify(directBooking)}`,
+  );
+  console.log(`▸ phrasing: ${coordinationCases.length} terse+verbose coordination forms → freeBusy + call-peer; timed booking stays createEvent ✓`);
 
   let imageSeen = false;
   let peerSeen = false;

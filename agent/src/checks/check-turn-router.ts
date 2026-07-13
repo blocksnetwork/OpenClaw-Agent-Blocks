@@ -35,7 +35,13 @@ try {
     expect("Ask Kayley's assistant if she's free Thursday.", 'assistant');
     expect('What is this image — give me a caption', 'assistant');
     expect('confirm_0123456789abcdef', 'assistant');
-    console.log('▸ assistant: calendar / mail / poster / image / peer / confirm-token turns route to the PA ✓');
+    // Image-CREATION phrasings beyond the literal "poster"/"image" — the
+    // canonical createsImage() matcher (intent-tags) drives this now, so
+    // these no longer fall through to the gateway.
+    expect('Generate a logo for my coffee shop.', 'assistant');
+    expect('Draw a picture of a fox in the snow.', 'assistant');
+    expect('Design an illustration for the cover.', 'assistant');
+    console.log('▸ assistant: calendar / mail / image create+understand / peer / confirm-token turns route to the PA ✓');
   }
 
   // 2. Specialist — a LinkedIn URL to analyze, or a catalog discovery question.
@@ -74,6 +80,114 @@ try {
     // @ts-expect-error — guard the runtime path the client can hit (null text).
     assert(classifyTurn(null).route === 'gateway', 'null text must degrade to gateway');
     console.log('▸ robustness: empty / null input degrades to the gateway without throwing ✓');
+  }
+
+  // 6. Peer-coordination phrasing variety — the intent-shaped fast-path
+  //    (looksPeerCoordination) must route TERSE coordination forms to the PA,
+  //    not just the verbose "coordinate/both free" vocabulary, because the
+  //    difference is phrasing, not intent. It must stay CONSERVATIVE: ordinary
+  //    chat that merely mentions time (no named peer to coordinate with) stays
+  //    on the gateway.
+  {
+    // Terse forms that used to fall through to the gateway / answer-direct.
+    expect('Find a time for me and bob to meet', 'assistant');
+    expect('set up 30 min with Sam', 'assistant');
+    expect('when are Kayley and I both free Thursday?', 'assistant');
+    expect('find a slot that works for both me and Kayley', 'assistant');
+    expect('time to meet with Dana next week', 'assistant');
+    // The verbose form still routes to the PA (regression guard).
+    expect('Coordinate with Bob to find a time we are both free tomorrow afternoon for a 30 minute meeting.', 'assistant');
+    // Negatives — ordinary chat that mentions time but names no peer to
+    // coordinate with must stay on the gateway (don't over-match).
+    expect('what time is it in Tokyo?', 'gateway');
+    expect('set a 10 minute timer', 'gateway');
+    expect('what a great time we had at the party', 'gateway');
+    console.log('▸ phrasing: terse + verbose coordination reach the PA; bare time-mentions stay on the gateway ✓');
+  }
+
+  // 7. Phrasing-variety battery — MANY wordings per intent must land on the
+  //    same route. This is the durable-fix contract of §6: routing generalizes
+  //    over vocabulary instead of enumerating it, so a new way to say the same
+  //    thing does not silently fall through to the gateway.
+  {
+    const battery: Array<{ route: TurnRoute; phrasings: string[] }> = [
+      {
+        route: 'assistant', // create an image (text-to-image)
+        phrasings: [
+          'Make me a poster for the launch.',
+          'Generate a logo for my coffee shop.',
+          'Draw a picture of a fox in the snow.',
+          'Design an illustration for the cover.',
+          'Render an icon for the app.',
+          'Paint a portrait of my dog.',
+          'sketch a wallpaper of mountains',
+        ],
+      },
+      {
+        route: 'assistant', // understand an existing/attached image (image-to-text)
+        phrasings: [
+          'What is this image?',
+          'Give me a caption for this photo.',
+          'Describe this picture for me.',
+          'Read the text in this screenshot.',
+          'Can you identify what is in this pic?',
+        ],
+      },
+      {
+        route: 'assistant', // calendar / availability / mail / identity
+        phrasings: [
+          "What's my availability tomorrow afternoon?",
+          'Am I free Thursday?',
+          "What's on my calendar today?",
+          'Book a 30 minute meeting with Sam on Friday.',
+          'Draft an email to the team about the launch.',
+          'Check my email for anything from Dana.',
+          "Who are you and what's my email and timezone?",
+        ],
+      },
+      {
+        route: 'assistant', // peer coordination — terse and verbose
+        phrasings: [
+          'Find a time for me and bob to meet',
+          'set up 30 min with Sam',
+          'when are Kayley and I both free Thursday?',
+          'find a slot that works for both me and Kayley',
+          'time to meet with Dana next week',
+          'Coordinate with Bob so we are both free tomorrow afternoon.',
+        ],
+      },
+      {
+        route: 'specialist', // catalog discovery + LinkedIn tone + random agent
+        phrasings: [
+          'What agents on Blocks can summarize a document?',
+          'Find a translation agent in the catalog',
+          'Which Blocks tools support Gemini?',
+          'Show me the models on blocks.ai',
+          'Use a random Blocks agent that looks cool',
+          'Analyze the tone of https://linkedin.com/in/jane-doe',
+        ],
+      },
+      {
+        route: 'gateway', // ordinary chat, incl. the "Summarize Blocks.ai" trap
+        phrasings: [
+          'Summarize Blocks.ai in three bullets.',
+          'Give me three icebreakers for a remote team offsite',
+          'Tell me a joke about debugging.',
+          'Explain transformers like I am five.',
+          'What time is it in Tokyo?',
+          'Write me a haiku about the ocean.',
+        ],
+      },
+    ];
+
+    let phrasingCount = 0;
+    for (const { route, phrasings } of battery) {
+      for (const text of phrasings) {
+        expect(text, route);
+        phrasingCount += 1;
+      }
+    }
+    console.log(`▸ phrasing-variety: ${phrasingCount} wordings across image/calendar/peer/specialist/gateway all route correctly ✓`);
   }
 
   console.log('\naudit: one authoritative gate; precedence assistant > specialist > gateway, fully offline');

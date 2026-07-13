@@ -24,6 +24,9 @@
     Check: (p) => <I {...p}><path d="M20 6L9 17l-5-5" /></I>,
     Close: (p) => <I {...p}><path d="M18 6L6 18M6 6l12 12" /></I>,
     Chevron: (p) => <I {...p}><path d="M9 18l6-6-6-6" /></I>,
+    ChevronLeft: (p) => <I {...p}><path d="M15 18l-6-6 6-6" /></I>,
+    ChevronRight: (p) => <I {...p}><path d="M9 18l6-6-6-6" /></I>,
+    Search: (p) => <I {...p}><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></I>,
     Refresh: (p) => <I {...p}><path d="M21 12a9 9 0 0 1-15.5 6.2M3 12A9 9 0 0 1 18.5 5.8" /><path d="M21 4v5h-5M3 20v-5h5" /></I>,
     Sidebar: (p) => <I {...p}><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M9 3v18" /></I>,
   };
@@ -347,35 +350,52 @@
           <b>Blocks agents</b>
           <span>{agents.length} result{agents.length === 1 ? "" : "s"} · status checked on send</span>
         </div>
-        <div className="catalog-agent-grid">
-          {visible.map((agent) => {
-            const handle = agent.handle || agent.agentName;
-            const selected = selectedHandle && handle === selectedHandle;
-            return (
-              <div className={"catalog-agent-card" + (selected ? " selected" : "")} key={handle || agent.displayName || agent.name}>
-                <div className="catalog-agent-top">
-                  <div className="catalog-agent-name">
-                    <b>{agent.displayName || agent.handle || "Blocks agent"}</b>
-                    {agent.handle && agent.displayName !== agent.handle ? <small>{agent.handle}</small> : null}
-                  </div>
-                  <span className="catalog-price">{formatAgentPrice(agent)}</span>
-                </div>
-                <div className="catalog-agent-tags">
-                  {(Array.isArray(agent.tags) ? agent.tags : []).slice(0, 3).map((tag) => <span key={tag}>{tag}</span>)}
-                </div>
-                {agent.description ? <p>{shortDescription(agent.description)}</p> : null}
-                {agent.whyMatched ? <small className="catalog-agent-reason">{agent.whyMatched}</small> : null}
-                <small className="catalog-agent-availability">Public listing · availability checked when used</small>
-                <button className={"catalog-use-btn" + (selected ? " selected" : "")} disabled={disabled} onClick={() => onUse && onUse(agent)}>
-                  {selected ? <Icons.Check s={14} /> : <Icons.Send s={14} />} {selected ? "Attached to prompt" : "Use this agent"}
-                </button>
-              </div>
-            );
-          })}
-        </div>
+        <CatalogAgentGrid agents={visible} disabled={disabled} selectedHandle={selectedHandle} onUse={onUse} />
         {agents.length > visible.length ? <div className="catalog-agent-more">Showing {visible.length} of {agents.length}. Narrow the prompt to filter more.</div> : null}
       </div>
     );
+  }
+
+  // The reusable grid of "Use this agent" cards, shared by the chat-triggered
+  // CatalogAgentCards (≤8) and the always-on NetworkAgentsPanel (paged). One
+  // card renderer = one place the price/billing, tags, reason, and select flow
+  // live.
+  function CatalogAgentGrid({ agents, disabled, selectedHandle, onUse }) {
+    return (
+      <div className="catalog-agent-grid">
+        {agents.map((agent) => {
+          const handle = agent.handle || agent.agentName;
+          const selected = selectedHandle && handle === selectedHandle;
+          const paid = isPaidAgent(agent);
+          return (
+            <div className={"catalog-agent-card" + (selected ? " selected" : "")} key={handle || agent.displayName || agent.name}>
+              <div className="catalog-agent-top">
+                <div className="catalog-agent-name">
+                  <b>{agent.displayName || agent.handle || "Blocks agent"}</b>
+                  {agent.handle && agent.displayName !== agent.handle ? <small>{agent.handle}</small> : null}
+                </div>
+                <span className={"catalog-price" + (paid ? " paid" : "")} title={paid ? "Paid agent — you are billed per call" : "Free agent"}>{formatAgentPrice(agent)}</span>
+              </div>
+              <div className="catalog-agent-tags">
+                {(Array.isArray(agent.tags) ? agent.tags : []).slice(0, 3).map((tag) => <span key={tag}>{tag}</span>)}
+              </div>
+              {agent.description ? <p>{shortDescription(agent.description)}</p> : null}
+              {agent.whyMatched ? <small className="catalog-agent-reason">{agent.whyMatched}</small> : null}
+              <small className="catalog-agent-availability">Public listing · availability checked when used</small>
+              <button className={"catalog-use-btn" + (selected ? " selected" : "")} disabled={disabled} onClick={() => onUse && onUse(agent)}>
+                {selected ? <Icons.Check s={14} /> : <Icons.Send s={14} />} {selected ? "Attached to prompt" : "Use this agent"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function isPaidAgent(agent) {
+    if (!agent) return false;
+    if (agent.billingMode) return agent.billingMode === "paid";
+    return Number(agent.price && agent.price.amount) > 0;
   }
 
   function formatAgentPrice(agent) {
@@ -388,6 +408,155 @@
   function shortDescription(value) {
     const text = String(value || "").replace(/\s+/g, " ").trim();
     return text.length > 150 ? text.slice(0, 147) + "..." : text;
+  }
+
+  // Always-on, lazy-loaded panel that browses the FULL public Blocks registry
+  // (not just the ≤8 chat-triggered cards). It is deliberately collapsed until
+  // opened so the dashboard doesn't walk the registry on every load; opening it
+  // pulls page 1 via the browse route (full walk + 60s cache). Search is
+  // debounced and server-side, paging is server-side (50/page), and the scope
+  // line is honest about truncation, scan size, and that a listing ≠ liveness.
+  function NetworkAgentsPanel({ settings, selectedAgent, onUseAgent, disabled }) {
+    const PAGE = 50;
+    const [open, setOpen] = useState(false);
+    const [query, setQuery] = useState("");
+    const [debounced, setDebounced] = useState("");
+    const [offset, setOffset] = useState(0);
+    const [refreshTick, setRefreshTick] = useState(0);
+    const [state, setState] = useState({ loading: false, data: null, error: "" });
+    // One-shot: only the explicit "re-scan" button forces refresh=1; ordinary
+    // paging/searching rides the 60s cache so we don't re-walk the registry.
+    const refreshOnceRef = useRef(false);
+
+    // Debounce the search box → q, snapping back to the first page on a new query.
+    useEffect(() => {
+      const id = setTimeout(() => {
+        setDebounced((prev) => {
+          const next = query.trim();
+          if (next !== prev) setOffset(0);
+          return next;
+        });
+      }, 300);
+      return () => clearTimeout(id);
+    }, [query]);
+
+    // Lazy: no registry walk happens until the panel is opened.
+    useEffect(() => {
+      if (!open) return;
+      const controller = new AbortController();
+      const forceRefresh = refreshOnceRef.current;
+      refreshOnceRef.current = false;
+      setState((prev) => ({ ...prev, loading: true, error: "" }));
+      window.browseNetworkAgents(
+        settings,
+        { offset, limit: PAGE, q: debounced, refresh: forceRefresh },
+        controller.signal,
+      )
+        .then((data) => setState({ loading: false, data, error: "" }))
+        .catch((err) => {
+          if (err && err.name === "AbortError") return;
+          setState({ loading: false, data: null, error: String(err.message || err) });
+        });
+      return () => controller.abort();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [open, offset, debounced, refreshTick, settings.baseUrl]);
+
+    const data = state.data;
+    const agents = data && Array.isArray(data.agents) ? data.agents : [];
+    const matched = data ? Number(data.matched) || 0 : 0;
+    const selectedHandle = selectedAgent && (selectedAgent.handle || selectedAgent.agentName);
+    const from = matched === 0 ? 0 : offset + 1;
+    const to = Math.min(offset + PAGE, matched);
+    const hasPrev = offset > 0;
+    const hasNext = offset + PAGE < matched;
+
+    return (
+      <section className="overview-panel network-panel" aria-label="Network agents">
+        <div className="overview-head">
+          <div>
+            <div className="overview-title">Network agents</div>
+            <div className="overview-sub">{networkScopeLine(open, state, data)}</div>
+          </div>
+          <div className="network-head-actions">
+            {open ? (
+              <button className="icon-btn" title="Re-scan the registry" onClick={() => { refreshOnceRef.current = true; setRefreshTick((t) => t + 1); }} disabled={state.loading}>
+                <Icons.Refresh s={16} />
+              </button>
+            ) : null}
+            <button className="network-toggle-btn" onClick={() => setOpen((o) => !o)}>
+              {open ? "Hide" : "Browse all"}
+            </button>
+          </div>
+        </div>
+
+        {open ? (
+          <div className="network-body">
+            <div className="network-search">
+              <Icons.Search s={15} />
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search the whole network — name, tag, capability…"
+                aria-label="Search network agents"
+              />
+              {query ? (
+                <button className="network-search-clear" title="Clear search" onClick={() => setQuery("")}>
+                  <Icons.Close s={13} />
+                </button>
+              ) : null}
+            </div>
+
+            {state.error ? (
+              <div className="overview-empty">{state.error}</div>
+            ) : agents.length ? (
+              <React.Fragment>
+                <div className="network-result-line">
+                  Showing {from}–{to} of {matched}{matched === 1 ? " agent" : " agents"}
+                  {debounced ? ` for “${debounced}”` : ""} · availability checked when used
+                </div>
+                <CatalogAgentGrid
+                  agents={agents}
+                  disabled={disabled}
+                  selectedHandle={selectedHandle}
+                  onUse={(agent) => onUseAgent && onUseAgent(agent)}
+                />
+                {data && data.truncated ? (
+                  <div className="network-truncated">
+                    Showing the first {data.scanned}{data.totalCount ? ` of ${data.totalCount}` : ""} agents — the registry is larger than the scan limit, so refine your search to reach the rest.
+                  </div>
+                ) : null}
+                <div className="network-pager">
+                  <button className="network-page-btn" disabled={!hasPrev || state.loading} onClick={() => setOffset(Math.max(0, offset - PAGE))}>
+                    <Icons.ChevronLeft s={15} /> Prev
+                  </button>
+                  <span className="network-page-info">Page {Math.floor(offset / PAGE) + 1}</span>
+                  <button className="network-page-btn" disabled={!hasNext || state.loading} onClick={() => setOffset(offset + PAGE)}>
+                    Next <Icons.ChevronRight s={15} />
+                  </button>
+                </div>
+              </React.Fragment>
+            ) : (
+              <div className="overview-empty">
+                {state.loading ? "Scanning the network…" : debounced ? `No agents match “${debounced}”.` : "No agents are listed right now."}
+              </div>
+            )}
+          </div>
+        ) : null}
+      </section>
+    );
+  }
+
+  function networkScopeLine(open, state, data) {
+    if (!open) return "Browse every public agent on the Blocks network";
+    if (state.loading && !data) return "Scanning the registry…";
+    if (state.error) return "Network unavailable";
+    if (!data) return "Browse every public agent on the Blocks network";
+    const total = data.totalCount != null ? data.totalCount : data.scanned;
+    if (data.truncated) {
+      return `Scanned ${data.scanned}${data.totalCount ? " of " + data.totalCount : ""} agents (registry is larger — refine to see more)`;
+    }
+    return `${total} public agent${total === 1 ? "" : "s"} · free & paid · listing ≠ liveness`;
   }
 
   function AssistantConfirmCard({ artifact, state, disabled, onAction }) {
@@ -1317,6 +1486,21 @@
             </div>
 
             <div className="settings-section">
+              <h4>Image generation</h4>
+              <span className="hint">When more than one Blocks text-to-image agent can do the job, how should they be coordinated? Collapses to a single hire when only one agent is available; only free agents are hired.</span>
+            </div>
+            <div className="field">
+              <label>When multiple image agents match</label>
+              <select value={s.imageStrategy || "single"} onChange={(e) => set("imageStrategy", e.target.value)}>
+                <option value="single">Single — hire the best-ranked agent (fastest, cheapest)</option>
+                <option value="race">Race — hire all, first image to finish wins</option>
+                <option value="compare">Compare — hire all, show every agent’s image</option>
+                <option value="best">Best — hire all, a local judge picks the winner</option>
+              </select>
+              <span className="hint">Race &amp; Best return one picture (from several hires); Compare shows them all side by side.</span>
+            </div>
+
+            <div className="settings-section">
               <h4>Demo session</h4>
               <span className="hint">Clear saved chats in this browser while keeping the selected bridge, owner, profile, contacts, and Google connection.</span>
             </div>
@@ -1422,6 +1606,115 @@
     );
   }
 
+  /* ------------------- Meeting-request handshake -------------------- */
+  // Two-sided peer booking: subscribes to the owner-scoped notification
+  // channel and surfaces each live meeting request. The initiator sees
+  // "Waiting for … to accept"; the peer gets an actionable card with
+  // Accept / Decline. A meeting commits to BOTH calendars only once both
+  // owners accept, so this panel is the owner's entry point into that
+  // handshake — never an auto-book.
+  function MeetingRequestsPanel({ settings }) {
+    const ownerId = ((settings && settings.ownerId) || "").trim();
+    // threadId → latest notification (newest state wins, like the server fold).
+    const [byThread, setByThread] = useState({});
+    const [busy, setBusy] = useState({});
+    const [error, setError] = useState("");
+
+    useEffect(() => {
+      if (!ownerId) return;
+      setByThread({});
+      setError("");
+      let sub = null;
+      try {
+        sub = window.subscribeMeetingRequests(settings, {
+          onMeetingRequest: (note) => {
+            if (!note || !note.threadId) return;
+            setByThread((prev) => ({ ...prev, [note.threadId]: note }));
+          },
+          onError: (err) => setError(String((err && err.message) || err)),
+        });
+      } catch (err) {
+        setError(String((err && err.message) || err));
+      }
+      return () => { if (sub) sub.cancel(); };
+    }, [settings.baseUrl, settings.token, ownerId]);
+
+    const respond = useCallback((note, decision) => {
+      setBusy((prev) => ({ ...prev, [note.threadId]: decision }));
+      window.respondMeetingRequest(settings, {
+        threadId: note.threadId,
+        decision,
+        confirmToken: note.confirmToken,
+      })
+        .then(() => setError(""))
+        .catch((err) => setError(String((err && err.message) || err)))
+        .finally(() => setBusy((prev) => { const n = { ...prev }; delete n[note.threadId]; return n; }));
+    }, [settings.baseUrl, settings.token, ownerId]);
+
+    if (!ownerId) return null;
+    // Terminal states drop out of the active list once resolved.
+    const active = Object.values(byThread).filter(
+      (n) => n.status === "pending-both" || n.status === "both-accepted",
+    );
+    const resolved = Object.values(byThread).filter(
+      (n) => n.status === "committed" || n.status === "declined" || n.status === "expired" || n.status === "commit-failed",
+    );
+    if (!active.length && !resolved.length && !error) return null;
+
+    return (
+      <section className="mreq-panel" aria-label="Meeting requests">
+        <div className="mreq-head">
+          <div className="mreq-title">Meeting requests</div>
+          <div className="mreq-sub">Two-sided booking · both owners must accept</div>
+        </div>
+        {error ? <div className="mreq-error">{error}</div> : null}
+        {active.map((note) => {
+          const actionable = note.status === "pending-both" && !!note.confirmToken;
+          const working = busy[note.threadId];
+          return (
+            <div key={note.threadId} className={"mreq-card " + (actionable ? "actionable" : "waiting")}>
+              <div className="mreq-msg">{note.message || "Meeting request"}</div>
+              <div className="mreq-meta">
+                <span className={"mreq-badge status-" + note.status}>{mreqStatusLabel(note.status)}</span>
+                {note.role ? <span className="mreq-role">{note.role === "peer" ? "You were invited" : "You proposed"}</span> : null}
+              </div>
+              {actionable ? (
+                <div className="mreq-actions">
+                  <button className="mreq-btn accept" disabled={!!working}
+                    onClick={() => respond(note, "accept")}>
+                    {working === "accept" ? "Accepting…" : "Accept"}
+                  </button>
+                  <button className="mreq-btn decline" disabled={!!working}
+                    onClick={() => respond(note, "decline")}>
+                    {working === "decline" ? "Declining…" : "Decline"}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+        {resolved.map((note) => (
+          <div key={note.threadId} className="mreq-card resolved">
+            <div className="mreq-msg">{note.message || mreqStatusLabel(note.status)}</div>
+            <span className={"mreq-badge status-" + note.status}>{mreqStatusLabel(note.status)}</span>
+          </div>
+        ))}
+      </section>
+    );
+  }
+
+  function mreqStatusLabel(status) {
+    switch (status) {
+      case "pending-both": return "Awaiting both";
+      case "both-accepted": return "Booking…";
+      case "committed": return "Booked";
+      case "declined": return "Declined";
+      case "expired": return "Expired";
+      case "commit-failed": return "Booking failed";
+      default: return status || "";
+    }
+  }
+
   /* ----------------------------- Toast ------------------------------ */
   function Toast({ text }) { return text ? <div className="toast">{text}</div> : null; }
 
@@ -1431,5 +1724,5 @@
   // main thread and can crash the tab.
   const MemoMessage = React.memo(Message);
 
-  Object.assign(window, { Icons, Sidebar, ToolActivity, ThinkingTabs, Message: MemoMessage, EmptyState, AssistantOverviewPanel, SettingsModal, Lightbox, Toast });
+  Object.assign(window, { Icons, Sidebar, ToolActivity, ThinkingTabs, Message: MemoMessage, EmptyState, AssistantOverviewPanel, MeetingRequestsPanel, NetworkAgentsPanel, SettingsModal, Lightbox, Toast });
 })();

@@ -11,6 +11,8 @@
  */
 
 import { TAGS, tagForRequest, imageAlreadyRead } from '../routing/intent-tags.ts';
+import { peerCoordinationPersonRef, stripTerminalPunctuation } from '../routing/peer-coordination.ts';
+import { deterministicClassify, type ClassifyContext } from '../routing/classify.ts';
 
 export interface RunSkillOptions {
   gatewayUrl?: string;
@@ -205,6 +207,18 @@ function localStub(skill: string, inputs: Record<string, unknown>): unknown {
       // ordered steps[] plan, threading the first result into the second.
       return planPersonalAssistant(inputs);
     }
+    case 'intent_classify': {
+      // Offline mirror of the model-assisted classifier: the SAME deterministic
+      // decision the live path degrades to, so `runSkill('intent_classify', …,
+      // { offline: true })` and the live brain stay in taxonomy lock-step.
+      const text = typeof inputs.text === 'string' ? inputs.text : '';
+      const rawContext = inputs.context;
+      const context: ClassifyContext =
+        typeof rawContext === 'object' && rawContext !== null && !Array.isArray(rawContext)
+          ? (rawContext as ClassifyContext)
+          : {};
+      return deterministicClassify(text, context);
+    }
     case 'pick_best': {
       // Deterministic judge stand-in: prefer the first candidate whose
       // output reads like a finished answer (a string `summary`), else
@@ -377,45 +391,6 @@ function planPeerCoordination(request: string): StubPlan | null {
     reply: `I'll check your calendar and coordinate with ${personRef}'s assistant.`,
     steps,
   };
-}
-
-function peerCoordinationPersonRef(request: string): string | null {
-  const lower = request.toLowerCase();
-  const coordinates =
-    /\b(coordinat\w*|compare|mutual|together)\b/u.test(lower) ||
-    /\bworks?\s+for\s+both\b/u.test(lower) ||
-    /\bboth\b.*\b(free|available|availability|busy)\b/u.test(lower) ||
-    /\b(free|available|availability|busy)\b.*\bboth\b/u.test(lower);
-  const asksAvailability =
-    /\b(free|busy|available|availability|calendar|time|slot|meeting|schedule|morning|afternoon|evening)\b/u.test(lower);
-  if (!coordinates || !asksAvailability) return null;
-
-  const patterns = [
-    /\bwith\s+(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
-    /\b(?:ask|coordinate|check|compare|sync)\s+(?:with\s+)?(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
-    /\b(@?[a-z][a-z0-9_.@'’-]*)\s+and\s+(?:i|me)\b/iu,
-    /\b(?:i|me)\s+and\s+(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
-  ];
-  for (const pattern of patterns) {
-    const match = request.match(pattern);
-    const ref = normalizePeerReference(match?.[1]);
-    if (ref) return ref;
-  }
-  return null;
-}
-
-function normalizePeerReference(value: string | undefined): string | null {
-  const ref = (value ?? '')
-    .replace(/['’]s$/u, '')
-    .replace(/[^\p{L}\p{N}_@.'’-]+$/gu, '')
-    .trim();
-  if (!ref) return null;
-  if (/^(me|my|mine|i|you|your|calendar|meeting|event|call|time|slot|the|a|an)$/iu.test(ref)) return null;
-  return ref;
-}
-
-function stripTerminalPunctuation(value: string): string {
-  return value.trim().replace(/[.!?]+$/u, '');
 }
 
 /** Route a single request to one action (the original keyword router). */

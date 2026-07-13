@@ -45,6 +45,12 @@ const DEFAULT_SETTINGS = {
   ownerId: (typeof window !== "undefined" && window.OPENCLAW_CONFIG && window.OPENCLAW_CONFIG.ownerId) || "",
   token: "",
   theme: "light",
+  // When more than one Blocks text-to-image agent can do the job:
+  //   single  → hire the single best-ranked agent (default: cheapest/fastest)
+  //   race    → hire all, first image to land wins
+  //   compare → hire all, show every image side by side
+  //   best    → hire all, a local judge picks the winner
+  imageStrategy: "single",
 };
 
 function loadSettings() {
@@ -226,6 +232,40 @@ async function describeImage(attachment, prompt, settings, signal) {
   return text;
 }
 
+/* ---------------------- text → image (Blocks) -------------------------- */
+// Send an image-creation prompt to the foundation server's
+// /api/generate-image, which discovers a text-to-image agent on Blocks,
+// ranks it with the same chooseSpecialist logic the assistant path uses,
+// hires it, and returns the rendered picture as a Markdown artifact
+// (`![…](url)`) plus its media descriptor. This is how "generate a logo" /
+// "draw a picture" reaches Blocks deterministically instead of the gateway's
+// own model. Mirrors describeImage. Returns the full bridge payload; a
+// `matched:false` (or thrown error) means the caller should fall back to the
+// gateway — never fabricate an image.
+async function generateImage(prompt, settings, signal) {
+  const baseUrl = ((settings && settings.baseUrl) || "").replace(/\/$/, "");
+  const headers = { "Content-Type": "application/json" };
+  if (settings && settings.token) headers["Authorization"] = `Bearer ${settings.token}`;
+
+  const strategy = (settings && settings.imageStrategy) || "single";
+  const res = await fetch(`${baseUrl}/api/generate-image`, {
+    method: "POST",
+    headers,
+    // Default to free so a paid image agent is never hired silently.
+    // `strategy` coordinates multiple agents when more than one is discovered
+    // (single | race | compare | best); the bridge collapses to single when
+    // only one agent exists.
+    body: JSON.stringify({ prompt: (prompt || "").trim(), billingMode: "free", strategy }),
+    signal,
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok || !data || data.ok === false) {
+    throw new Error((data && data.error) || `Image generation failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
 // Cheap client gate: only attempt intent routing when the text plausibly
 // matches a specialist. Keeps the "Finding a specialist…" step from flashing
 // on every normal chat. The bridge does the authoritative match in /api/route.
@@ -268,7 +308,98 @@ function looksRoutable(text) {
 function looksPersonalAssistant(text) {
   const t = text || "";
   return /\bconfirm_[a-f0-9]{16}\b/i.test(t)
-    || /\b(availability|available|free|busy|calendar|schedule|meeting|book|draft an email|email|gmail|poster|image|ask .+ assistant)\b/i.test(t);
+    || /\b(availability|available|free|busy|calendar|schedule|meeting|book|draft an email|email|gmail|ask .+ assistant)\b/i.test(t)
+    || looksPeerCoordination(t)
+    || createsImage(t)
+    || understandsImage(t);
+}
+
+// Byte-identical port of the ONE shared peer-coordination detector in
+// src/routing/peer-coordination.ts (mirrored here because the browser lib is a
+// standalone script with no module imports). Coordination is intent-shaped,
+// not keyword-exact: a scheduling/availability intent ("coordinate", "find a
+// time", "when are we both free", "set up …", "…to meet") combined with a
+// coordination-shaped person reference ("with Bob", "me and Bob", "Kayley and
+// I") means coordination — so the terse "find a time for me and Bob to meet"
+// routes to the PA like the verbose "coordinate with Bob". It stays
+// conservative: an explicitly-timed direct booking ("book … with Sam on Friday
+// at 2pm") is NOT coordination, and ordinary chat that merely mentions time
+// ("what time is it in Tokyo?") carries no person reference. Keep in sync with
+// peer-coordination.ts.
+const PEER_REF_PATTERNS = [
+  /\bwith\s+(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
+  /\b(?:ask|coordinate|check|compare|sync)\s+(?:with\s+)?(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
+  /\b(@?[a-z][a-z0-9_.@'’-]*)\s+and\s+(?:i|me)\b/iu,
+  /\b(?:i|me)\s+and\s+(@?[a-z][a-z0-9_.@'’-]*)\b/iu,
+];
+
+function peerCoordinationIsExplicitBooking(lower) {
+  return (
+    /\b(book|create|add)\b/.test(lower) ||
+    /\bat\s+\d/.test(lower) ||
+    /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/.test(lower) ||
+    /\b\d{1,2}:\d{2}\b/.test(lower)
+  );
+}
+
+function peerCoordinationIntent(lower) {
+  if (/\b(coordinat\w*|compare|mutual|together)\b/.test(lower)) return true;
+  if (/\bworks?\s+for\s+both\b/.test(lower)) return true;
+  if (/\bboth\b[\s\S]*\b(free|available|availability|busy)\b/.test(lower)) return true;
+  if (/\b(free|available|availability|busy)\b[\s\S]*\bboth\b/.test(lower)) return true;
+  if (/\bfind\s+(?:me\s+|us\s+)?(?:a\s+|some\s+)?(?:time|slot)\b/.test(lower)) return true;
+  if (/\bwhen\s+(?:are|can|is)\b[\s\S]*\b(free|available)\b/.test(lower)) return true;
+  if (/\btime\s+to\s+(?:meet|talk|sync|chat|catch\s*up|connect)\b/.test(lower)) return true;
+  if (!peerCoordinationIsExplicitBooking(lower) && /\b(meet|set\s*up|schedule)\b/.test(lower)) return true;
+  return false;
+}
+
+function normalizePeerReference(value) {
+  const ref = (value || "")
+    .replace(/['’]s$/u, "")
+    .replace(/[^\p{L}\p{N}_@.'’-]+$/gu, "")
+    .trim();
+  if (!ref) return null;
+  if (/^(me|my|mine|i|you|your|calendar|meeting|event|call|time|slot|the|a|an)$/i.test(ref)) return null;
+  return ref;
+}
+
+function peerCoordinationPersonRef(request) {
+  const lower = (request || "").toLowerCase();
+  if (!peerCoordinationIntent(lower)) return null;
+  for (const pattern of PEER_REF_PATTERNS) {
+    const match = request.match(pattern);
+    const ref = normalizePeerReference(match && match[1]);
+    if (ref) return ref;
+  }
+  return null;
+}
+
+function looksPeerCoordination(text) {
+  return peerCoordinationPersonRef(text || "") !== null;
+}
+
+// Byte-identical port of the canonical create-vs-understand image matcher in
+// src/routing/intent-tags.ts (mirrored here because the browser lib is a
+// standalone script with no module imports). "image" is ambiguous, so each
+// intent is gated on the VERB/cue, never the bare noun: CREATE makes a NEW
+// picture (make/draw/generate a poster/logo/art); UNDERSTAND reads an EXISTING
+// one (caption/describe/"what is this"). Keep in sync with intent-tags.ts.
+const CREATE_IMAGE_VERB = /\b(make|create|generate|draw|design|render|produce|paint|sketch|illustrate)\b/;
+const IMAGE_SUBJECT = /\b(images?|pictures?|photos?|posters?|logos?|art|illustrations?|drawings?|portraits?|icons?|graphics?|wallpapers?)\b/;
+const UNDERSTAND_IMAGE_CUE = /\b(caption|describe|identify|recogni[sz]e|read|extract|ocr|analy[sz]e|what(?:'s|’s| is| are)?)\b/;
+const EXISTING_IMAGE = /\b(images?|pictures?|photos?|screenshots?|pics?)\b/;
+const IMAGE_ALREADY_READ = /image understanding from blocks/;
+
+function createsImage(text) {
+  const t = (text || "").toLowerCase();
+  return CREATE_IMAGE_VERB.test(t) && IMAGE_SUBJECT.test(t);
+}
+
+function understandsImage(text) {
+  const t = (text || "").toLowerCase();
+  return IMAGE_ALREADY_READ.test(t)
+    || (!CREATE_IMAGE_VERB.test(t) && UNDERSTAND_IMAGE_CUE.test(t) && EXISTING_IMAGE.test(t));
 }
 
 async function runAssistant(text, settings, signal, attachments) {
@@ -391,6 +522,90 @@ function resumeAssistant(envelope, settings, callbacks) {
   return streamAssistant(text, settings, callbacks);
 }
 
+/* ---- owner-scoped meeting-request handshake (two-sided peer booking) -----
+ * A net-new, owner-KEYED SSE channel — distinct from the per-request
+ * /api/assistant/stream — that pushes meeting-request state to BOTH owners:
+ * the initiator sees "Waiting for … to accept", the peer sees an actionable
+ * "Incoming meeting request …". It reuses the same fetch-stream + SSE framing
+ * as streamAssistant (rather than EventSource) so it can carry the bearer
+ * token. Returns a handle with cancel(); the server replays current state on
+ * connect, so a late subscriber never misses a pending request. */
+function subscribeMeetingRequests(settings, callbacks) {
+  const ownerId = ((settings && settings.ownerId) || "").trim();
+  if (!ownerId) throw new Error("Set an owner ID in Settings first.");
+  const baseUrl = ((settings && settings.baseUrl) || "").replace(/\/$/, "");
+  const headers = {};
+  if (settings && settings.token) headers["Authorization"] = `Bearer ${settings.token}`;
+  const controller = new AbortController();
+  const cb = callbacks || {};
+
+  (async () => {
+    try {
+      const res = await fetch(`${baseUrl}/api/assistant/notifications?owner=${encodeURIComponent(ownerId)}`, {
+        method: "GET",
+        headers,
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`Notifications stream failed (HTTP ${res.status})`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const raw = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          let event = "message";
+          const data = [];
+          for (const line of raw.split("\n")) {
+            const t = line.trimEnd();
+            if (t.startsWith("event:")) event = t.slice(6).trim();
+            else if (t.startsWith("data:")) data.push(t.slice(5).trim());
+          }
+          if (event !== "meeting-request" || !data.length) continue;
+          let payload;
+          try { payload = JSON.parse(data.join("\n")); } catch (e) { continue; }
+          cb.onMeetingRequest && cb.onMeetingRequest(payload);
+        }
+      }
+    } catch (err) {
+      if (err && err.name === "AbortError") return;
+      cb.onError && cb.onError(err);
+    }
+  })();
+
+  return { cancel: () => controller.abort() };
+}
+
+// Record this owner's accept/decline on a meeting request. Reuses the PAIRED
+// confirm-token pattern (one token per owner per threadId): the token arrives
+// on the actionable notification and is echoed back so an owner can only
+// accept their OWN side. The bilateral commit runs server-side on the second
+// acceptance; the resulting state change streams back over the SSE channel.
+async function respondMeetingRequest(settings, args) {
+  const ownerId = ((settings && settings.ownerId) || "").trim();
+  if (!ownerId) throw new Error("Set an owner ID in Settings first.");
+  const a = args || {};
+  const decision = a.decision === "decline" ? "decline" : "accept";
+  const baseUrl = ((settings && settings.baseUrl) || "").replace(/\/$/, "");
+  const headers = { "Content-Type": "application/json" };
+  if (settings && settings.token) headers["Authorization"] = `Bearer ${settings.token}`;
+  const res = await fetch(`${baseUrl}/api/assistant/meeting-request/${decision}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ownerId, threadId: a.threadId, ...(a.confirmToken ? { confirmToken: a.confirmToken } : {}) }),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok || !data || data.ok === false) {
+    throw new Error((data && data.error) || `Meeting ${decision} failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
 async function bridgeIdentity(settings, signal) {
   const baseUrl = ((settings && settings.baseUrl) || "").replace(/\/$/, "");
   const headers = {};
@@ -462,6 +677,32 @@ async function assistantOverview(settings, signal) {
   try { data = await res.json(); } catch (e) {}
   if (!res.ok || !data || data.ok === false) {
     throw new Error((data && data.error) || `Assistant overview failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
+// Browse the FULL public Blocks registry, one page at a time. Backed by the
+// bridge's /api/blocks/browse route (the full cursor walk + 60s cache), NOT the
+// single-page /api/blocks — so paging never silently misses agents past a
+// limit. Server-side pagination + search keeps the payload to one page; pass
+// { refresh: true } to force a fresh registry walk.
+async function browseNetworkAgents(settings, opts, signal) {
+  const baseUrl = ((settings && settings.baseUrl) || "").replace(/\/$/, "");
+  const o = opts || {};
+  const params = new URLSearchParams();
+  const offset = Number(o.offset);
+  const limit = Number(o.limit);
+  if (Number.isFinite(offset) && offset > 0) params.set("offset", String(Math.floor(offset)));
+  if (Number.isFinite(limit) && limit > 0) params.set("limit", String(Math.floor(limit)));
+  if (o.q && String(o.q).trim()) params.set("q", String(o.q).trim());
+  if (o.tag && String(o.tag).trim()) params.set("tag", String(o.tag).trim());
+  if (o.refresh) params.set("refresh", "1");
+  const qs = params.toString();
+  const res = await fetch(`${baseUrl}/api/blocks/browse${qs ? "?" + qs : ""}`, { headers: apiHeaders(settings), signal });
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok || !data || data.ok === false) {
+    throw new Error((data && data.error) || `Network agents lookup failed (HTTP ${res.status})`);
   }
   return data;
 }
@@ -780,8 +1021,11 @@ Object.assign(window, {
   ACCEPTED_IMAGE, processImageFile, readFileAsDataURL, loadImage,
   ACCEPTED_AUDIO,
   toApiMessages, splitDataUrl, transcribeAudio,
-  describeImage, splitImageDataUrl,
+  describeImage, generateImage, splitImageDataUrl,
+  createsImage, understandsImage,
   routeIntent, classifyTurn, looksRoutable, looksPersonalAssistant, runAssistant, streamAssistant, resumeAssistant, assistantResumeText, bridgeIdentity, integrationStatus, assistantOverview, peerStatus, invitePeer, startGoogleConnect,
+  subscribeMeetingRequests, respondMeetingRequest,
+  browseNetworkAgents,
   createSkillFile,
   loadProfile, saveProfile, loadContacts, saveContact, removeContact,
   streamChat,

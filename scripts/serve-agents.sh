@@ -34,6 +34,24 @@ is_agent_name() {
   [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
 }
 
+# Agents that live under agent/published/ but must NOT be served by default.
+#   pa_test_private            — findability/check probe only
+#   openclaw_poster_maker      — retired capability-bank agent (text-to-image)
+#   openclaw_narrator          — retired capability-bank agent (text-to-speech)
+#   openclaw_headliner         — retired capability-bank agent (headline-write)
+# These can still be served on demand by passing the name explicitly or via
+# SERVE_AGENTS=. Override the retired set with RETIRED_AGENTS="a,b,c".
+RETIRED_AGENTS="${RETIRED_AGENTS:-pa_test_private,openclaw_poster_maker,openclaw_narrator,openclaw_headliner}"
+
+is_retired() {
+  local candidate="$1" item
+  local IFS=','
+  for item in $RETIRED_AGENTS; do
+    [[ "$item" == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
 normalize_agent_list() {
   local raw="$1"
   printf '%s\n' "$raw" | tr ',[:space:]' '\n'
@@ -44,7 +62,7 @@ default_agents() {
   for card in agent/published/*/agent-card.json; do
     [[ -f "$card" ]] || continue
     dir="$(basename "$(dirname "$card")")"
-    [[ "$dir" == "pa_test_private" ]] && continue
+    is_retired "$dir" && continue
     case "$dir" in
       openclaw_*|pa_*)
         name="$dir"

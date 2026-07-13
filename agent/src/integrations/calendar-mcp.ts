@@ -38,22 +38,46 @@ export interface CalendarRunOptions {
   now?: () => Date;
   /** Env overrides for a specific owner/integration runner. */
   env?: NodeJS.ProcessEnv;
+  /** Owner working hours — when set, an unspecified read window defaults to
+   *  these hours (instead of the full day) and "evening" is capped here. */
+  workingHours?: { start: string; end: string };
+  /** Owner IANA timezone used to anchor natural dates and clamp windows. */
+  timezone?: string;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;
 type Weekday = (typeof WEEKDAYS)[number];
 
+/** Owner working-hours + timezone hints applied to inferred windows. When
+ *  absent, `resolveWindow` keeps its historical full-day default and UTC day
+ *  anchoring so callers that don't know the owner still behave as before. */
+export interface WorkingHoursWindowOptions {
+  /** Owner working hours as local `HH:MM` strings. */
+  workingHours?: { start: string; end: string };
+  /** Owner IANA timezone used to anchor "today"/"tomorrow" and the current
+   *  clock. Without it, day anchoring falls back to UTC. */
+  timezone?: string;
+}
+
 /**
  * Resolve the `{ timeMin, timeMax }` ISO window for a free/busy query. An
  * explicit `timeMin`/`timeMax` in the action args wins. Common demo prompts
  * such as "tomorrow morning" and "next Tuesday afternoon" resolve to a
  * concrete window; otherwise it spans `now → now + windowDays`.
+ *
+ * When `opts.workingHours` is set, an INFERRED window (a bare date, or a named
+ * part of day like "evening") is clamped to the owner's working hours instead
+ * of the full day, so a plain "tomorrow" never widens the read past working
+ * hours and "evening" is capped at the working-hours end. An EXPLICIT time the
+ * owner stated ("from 8pm to 9pm", "at 3pm") is honored as-is — the clamp is
+ * for inference, not for overriding a clear instruction.
  */
 export function resolveWindow(
   args: Record<string, unknown>,
   windowDays: number,
   now: Date,
+  opts: WorkingHoursWindowOptions = {},
 ): { timeMin: string; timeMax: string } {
   const hasMin = typeof args.timeMin === 'string' && args.timeMin.trim() !== '';
   const start = hasMin ? new Date(args.timeMin as string) : now;
@@ -66,7 +90,7 @@ export function resolveWindow(
     return { timeMin, timeMax };
   }
 
-  const natural = resolveNaturalWindow(args.query, now);
+  const natural = resolveNaturalWindow(args.query, now, opts);
   if (natural) return natural;
 
   const timeMax =
@@ -76,17 +100,34 @@ export function resolveWindow(
   return { timeMin, timeMax };
 }
 
-function resolveNaturalWindow(query: unknown, now: Date): { timeMin: string; timeMax: string } | null {
+function resolveNaturalWindow(
+  query: unknown,
+  now: Date,
+  opts: WorkingHoursWindowOptions,
+): { timeMin: string; timeMax: string } | null {
   if (typeof query !== 'string' || query.trim() === '') return null;
   const lower = query.toLowerCase();
-  const explicitDate = resolveNaturalDate(lower, now);
+  const explicitDate = resolveNaturalDate(lower, now, opts.timezone);
   const range = resolveNaturalTimeRange(lower);
   // Nothing to anchor on: let the caller fall back to its look-ahead window.
   if (!explicitDate && !range) return null;
   // A bare time with no date defaults to today, or tomorrow if that time has
   // already passed, so "at 3pm" schedules against 3pm — not `now`.
-  const ymd = explicitDate ?? defaultDateForTime(range, now);
-  const effectiveRange = range ?? { start: '00:00:00', end: '23:59:59' };
+  const ymd = explicitDate ?? defaultDateForTime(range, now, opts.timezone);
+  const working = workingHoursClockRange(opts.workingHours);
+  let effectiveRange: { start: string; end: string };
+  if (!range) {
+    // An unspecified window (bare date, no time) defaults to the owner's
+    // working hours when known, otherwise the full day.
+    effectiveRange = working ?? { start: '00:00:00', end: '23:59:59' };
+  } else if (range.explicit || !working) {
+    // The owner named an explicit time — honor it verbatim.
+    effectiveRange = { start: range.start, end: range.end };
+  } else {
+    // A named part of day ("morning"/"afternoon"/"evening") is inferred, so
+    // clamp it into working hours (this is what caps "evening" at the end).
+    effectiveRange = clampRangeToWorkingHours(range, working);
+  }
   return {
     timeMin: `${ymd}T${effectiveRange.start}`,
     timeMax: `${ymd}T${effectiveRange.end}`,
@@ -94,17 +135,21 @@ function resolveNaturalWindow(query: unknown, now: Date): { timeMin: string; tim
 }
 
 /** Pick the day for a dateless time query: today when the time is still
- *  ahead, otherwise tomorrow. Uses the same UTC day basis as the rest of the
- *  resolver. */
-function defaultDateForTime(range: { start: string; end: string } | null, now: Date): string {
-  const today = utcDateOnly(now);
+ *  ahead, otherwise tomorrow. Anchors on the owner's timezone when known,
+ *  falling back to the UTC day basis. */
+function defaultDateForTime(
+  range: { start: string; end: string } | null,
+  now: Date,
+  timezone: string | undefined,
+): string {
+  const today = dayInZone(now, timezone);
   if (!range) return today;
-  const nowClock = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:00`;
+  const nowClock = clockInZone(now, timezone);
   return range.start > nowClock ? today : addDaysYmd(today, 1);
 }
 
-function resolveNaturalDate(lower: string, now: Date): string | null {
-  const today = utcDateOnly(now);
+function resolveNaturalDate(lower: string, now: Date, timezone: string | undefined): string | null {
+  const today = dayInZone(now, timezone);
   const explicit = lower.match(/\b(20\d{2}-\d{2}-\d{2})\b/u)?.[1];
   if (explicit) return explicit;
   if (/\btoday\b/u.test(lower)) return today;
@@ -118,14 +163,14 @@ function resolveNaturalDate(lower: string, now: Date): string | null {
   return null;
 }
 
-function resolveNaturalTimeRange(lower: string): { start: string; end: string } | null {
+function resolveNaturalTimeRange(lower: string): { start: string; end: string; explicit: boolean } | null {
   const explicit = lower.match(/\b(?:from\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:to|-|until|through)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/u);
   if (explicit) {
     const startSuffix = explicit[3] ?? explicit[6] ?? '';
     const endSuffix = explicit[6] ?? explicit[3] ?? '';
     const start = toClock(explicit[1], explicit[2], startSuffix);
     const end = toClock(explicit[4], explicit[5], endSuffix);
-    if (start && end) return { start, end };
+    if (start && end) return { start, end, explicit: true };
   }
   // A bare single time ("at 3pm", "3 pm", "15:00") anchors a default
   // one-hour window so the caller isn't silently widened to the whole day.
@@ -133,12 +178,91 @@ function resolveNaturalTimeRange(lower: string): { start: string; end: string } 
     ?? lower.match(/\b(?:at\s+)?(\d{1,2}):(\d{2})()\b/u);
   if (single) {
     const start = toClock(single[1], single[2], single[3] ?? '');
-    if (start) return { start, end: addHourClock(start) };
+    if (start) return { start, end: addHourClock(start), explicit: true };
   }
-  if (/\bmorning\b/u.test(lower)) return { start: '09:00:00', end: '12:00:00' };
-  if (/\bafternoon\b/u.test(lower)) return { start: '12:00:00', end: '17:00:00' };
-  if (/\bevening\b/u.test(lower)) return { start: '17:00:00', end: '21:00:00' };
+  // Named parts of day are INFERRED, not explicit — the caller may clamp them.
+  if (/\bmorning\b/u.test(lower)) return { start: '09:00:00', end: '12:00:00', explicit: false };
+  if (/\bafternoon\b/u.test(lower)) return { start: '12:00:00', end: '17:00:00', explicit: false };
+  if (/\bevening\b/u.test(lower)) return { start: '17:00:00', end: '21:00:00', explicit: false };
   return null;
+}
+
+/** Normalize a `{ start, end }` working-hours hint into zero-padded
+ *  `HH:MM:SS` clock strings, or null when malformed (so callers skip the
+ *  clamp rather than produce a broken window). */
+function workingHoursClockRange(
+  workingHours: { start: string; end: string } | undefined,
+): { start: string; end: string } | null {
+  if (!workingHours) return null;
+  const start = toWorkClock(workingHours.start);
+  const end = toWorkClock(workingHours.end);
+  if (!start || !end || start >= end) return null;
+  return { start, end };
+}
+
+function toWorkClock(value: string): string | null {
+  const match = value.trim().match(/^(\d{1,2}):(\d{2})$/u);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+}
+
+/** Intersect an inferred clock range with working hours. When the range falls
+ *  entirely outside working hours (e.g. "evening" for a 9–5 owner), fall back
+ *  to the working-hours window so the read still stays within hours. */
+function clampRangeToWorkingHours(
+  range: { start: string; end: string },
+  working: { start: string; end: string },
+): { start: string; end: string } {
+  const start = range.start > working.start ? range.start : working.start;
+  const end = range.end < working.end ? range.end : working.end;
+  if (start >= end) return { start: working.start, end: working.end };
+  return { start, end };
+}
+
+/** Local calendar date (`YYYY-MM-DD`) in the owner's timezone, or the UTC day
+ *  when no timezone is given (back-compat). */
+function dayInZone(now: Date, timezone: string | undefined): string {
+  if (!timezone) return utcDateOnly(now);
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(now);
+    const year = parts.find((part) => part.type === 'year')?.value;
+    const month = parts.find((part) => part.type === 'month')?.value;
+    const day = parts.find((part) => part.type === 'day')?.value;
+    if (year && month && day) return `${year}-${month}-${day}`;
+  } catch {
+    // Unknown timezone — fall back to UTC below.
+  }
+  return utcDateOnly(now);
+}
+
+/** Current `HH:MM:00` clock in the owner's timezone, or UTC when no timezone
+ *  is given. */
+function clockInZone(now: Date, timezone: string | undefined): string {
+  if (!timezone) {
+    return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:00`;
+  }
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+    }).formatToParts(now);
+    let hour = Number(parts.find((part) => part.type === 'hour')?.value ?? '0');
+    if (hour === 24) hour = 0;
+    const minute = Number(parts.find((part) => part.type === 'minute')?.value ?? '0');
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+  } catch {
+    return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:00`;
+  }
 }
 
 /** Add one hour to an `HH:MM:SS` clock, clamped to the end of the day so a
@@ -257,11 +381,15 @@ export function normalizeCreateEvent(result: McpToolResult): Record<string, unkn
 export function makeCalendarRunIntegration(caller: McpCaller, opts: CalendarRunOptions = {}): RunIntegration {
   const windowDays = opts.windowDays && opts.windowDays > 0 ? opts.windowDays : 7;
   const clock = opts.now ?? (() => new Date());
+  const windowOpts: WorkingHoursWindowOptions = {
+    ...(opts.workingHours ? { workingHours: opts.workingHours } : {}),
+    ...(opts.timezone ? { timezone: opts.timezone } : {}),
+  };
 
   return async (tool, args) => {
     const a = args ?? {};
     if (tool === 'calendar.freeBusy') {
-      const window = resolveWindow(a, windowDays, clock());
+      const window = resolveWindow(a, windowDays, clock(), windowOpts);
       const res = await caller.callTool('get-freebusy', {
         calendars: mcpCalendarRefs(a),
         timeMin: mcpDateTime(window.timeMin),
@@ -270,7 +398,7 @@ export function makeCalendarRunIntegration(caller: McpCaller, opts: CalendarRunO
       return normalizeFreeBusy(res, window);
     }
     if (tool === 'calendar.list') {
-      const window = resolveWindow(a, windowDays, clock());
+      const window = resolveWindow(a, windowDays, clock(), windowOpts);
       const res = await caller.callTool('list-events', { timeMin: window.timeMin, timeMax: window.timeMax });
       return { ok: res.isError !== true, tool, window, events: textOf(res) };
     }
@@ -358,13 +486,19 @@ export async function connectCalendarMcpFromEnv(envSource: NodeJS.ProcessEnv = p
  * The runtime calls this only when live AND `PA_CALENDAR_MCP_CMD` is set; a
  * failed call drops the cached client so the next call reconnects.
  */
-export function makeEnvCalendarRunIntegration(opts: Pick<CalendarRunOptions, 'env'> = {}): RunIntegration {
+export function makeEnvCalendarRunIntegration(
+  opts: Pick<CalendarRunOptions, 'env' | 'workingHours' | 'timezone'> = {},
+): RunIntegration {
   const env = opts.env ?? process.env;
   const windowDays = Number(env.PA_CALENDAR_WINDOW_DAYS ?? '7') || 7;
   let cached: { caller: McpCaller; close: () => Promise<void> } | null = null;
   return async (tool, args, runOpts) => {
     if (!cached) cached = await connectCalendarMcpFromEnv(env);
-    const run = makeCalendarRunIntegration(cached.caller, { windowDays });
+    const run = makeCalendarRunIntegration(cached.caller, {
+      windowDays,
+      ...(opts.workingHours ? { workingHours: opts.workingHours } : {}),
+      ...(opts.timezone ? { timezone: opts.timezone } : {}),
+    });
     try {
       return await run(tool, args, runOpts);
     } catch (err) {

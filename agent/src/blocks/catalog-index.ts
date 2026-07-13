@@ -435,6 +435,86 @@ export function formatPrice(price: Price): string {
   return `$${price.amount}/${price.unit === 'per_call' ? 'call' : price.unit}`;
 }
 
+/* ── browse (paginated, searchable full-registry view) ───────────────────── */
+
+/** Default page size for the always-on "browse the whole network" surface —
+ *  small enough that we never ship thousands of agents to the browser at once,
+ *  matching the 50/page the registry walker itself uses. */
+export const BROWSE_DEFAULT_LIMIT = 50;
+/** Hard upper bound on a single browse page, so a hand-crafted `limit` can't
+ *  turn the paginated surface back into a "dump the whole scan" request. */
+export const BROWSE_MAX_LIMIT = 100;
+
+export interface BrowseCatalogParams {
+  /** Zero-based index of the first result to return (default 0). */
+  offset?: number;
+  /** Page size (clamped to [1, BROWSE_MAX_LIMIT], default BROWSE_DEFAULT_LIMIT). */
+  limit?: number;
+  /** Optional relevance query, ranked via the shared `searchCatalog` pipeline. */
+  q?: string;
+  /** Optional exact tag prefilter applied before ranking. */
+  tag?: string;
+}
+
+export interface BrowseCatalogResult {
+  /** One page of ranked agents, serialized via `rankedAgentView`. */
+  agents: Record<string, unknown>[];
+  offset: number;
+  limit: number;
+  /** Total agents matching `q`/`tag` BEFORE the page slice (for paging math). */
+  matched: number;
+  /** How much of the registry the backing snapshot actually walked. */
+  scanned: number;
+  /** Registry size when reported (so the UI can say "showing X of N"). */
+  totalCount?: number;
+  /** True when the backing scan hit its cap with more agents available — the
+   *  page is a window into a PREFIX, not the whole network. */
+  truncated: boolean;
+}
+
+/**
+ * Paginate + search the full-registry snapshot for the always-on browse panel.
+ *
+ * This is the ONE place browse paging lives, and it deliberately reuses the
+ * single ranking path (`searchCatalog`) rather than a second filter: an empty
+ * query returns the whole (optionally tag-filtered) universe in the same
+ * deterministic score→price→handle order, so paging is stable across requests;
+ * a real query ranks by relevance. Slicing happens server-side so the browser
+ * only ever receives one page. `scanned`/`totalCount`/`truncated` are passed
+ * through unchanged so the surface stays honest about how much it can see.
+ */
+export function browseCatalog(
+  snapshot: { agents: CatalogAgent[]; scanned: number; totalCount?: number; truncated: boolean },
+  params: BrowseCatalogParams = {},
+): BrowseCatalogResult {
+  const offset = Number.isFinite(params.offset) ? Math.max(0, Math.floor(params.offset as number)) : 0;
+  const rawLimit = Number.isFinite(params.limit) ? Math.floor(params.limit as number) : BROWSE_DEFAULT_LIMIT;
+  const limit = Math.min(BROWSE_MAX_LIMIT, Math.max(1, rawLimit));
+  const q = (params.q ?? '').trim();
+  const tag = (params.tag ?? '').trim();
+
+  // Optional exact-tag prefilter (same semantics as the chat catalog route).
+  let universe = snapshot.agents;
+  if (tag) {
+    const wanted = tag.toLowerCase();
+    universe = universe.filter((a) => a.tags.some((t) => t.toLowerCase() === wanted));
+  }
+
+  const ranked = searchCatalog(universe, { query: q }).results;
+  const matched = ranked.length;
+  const agents = ranked.slice(offset, offset + limit).map(rankedAgentView);
+
+  return {
+    agents,
+    offset,
+    limit,
+    matched,
+    scanned: snapshot.scanned,
+    totalCount: snapshot.totalCount,
+    truncated: snapshot.truncated,
+  };
+}
+
 /** The standard visibility disclaimer — what catalog search can and can't see. */
 export const VISIBILITY_NOTE =
   'Note: catalog search sees public fields (handle, display name, provider, tags, description, price) — not private agent configuration.';

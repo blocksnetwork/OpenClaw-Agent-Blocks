@@ -126,8 +126,96 @@ export const CAPABILITY_TAGS: readonly CapabilityTag[] = INTENT_TAGS.map((e) => 
 const CAPABILITY_TAG_SET = new Set<string>(CAPABILITY_TAGS);
 
 /** True when `tag` is one of the canonical capability tags. */
-export function isCapabilityTag(tag: string): tag is CapabilityTag {
-  return CAPABILITY_TAG_SET.has(tag);
+export function isCapabilityTag(tag: unknown): tag is CapabilityTag {
+  return typeof tag === 'string' && CAPABILITY_TAG_SET.has(tag);
+}
+
+/* ── the closed routing taxonomy (§6) ─────────────────────────────────────
+ *
+ * The turn classifier (`turn-router.ts` deterministically, `/api/classify`
+ * model-assisted) sends every chat turn down exactly one of three PATHS and
+ * labels it with exactly one canonical INTENT id. Both the routes and the
+ * intent ids are a CLOSED set defined here — the single source of truth the
+ * classifier, the offline mirror, and the checks all import. The model may
+ * ONLY choose an intent from `INTENTS`; it never invents a route, an intent, or
+ * a tag. `check:skill-contract` diffs the `intent_classify` SKILL.md taxonomy
+ * table against this list, so the live prompt can never drift from the code.
+ */
+
+/** The three paths a chat turn can take. */
+export const ROUTES = ['assistant', 'specialist', 'gateway'] as const;
+export type Route = (typeof ROUTES)[number];
+
+const ROUTE_SET = new Set<string>(ROUTES);
+
+/** True when `value` is one of the canonical routes. */
+export function isRoute(value: unknown): value is Route {
+  return typeof value === 'string' && ROUTE_SET.has(value);
+}
+
+/** One canonical intent in the closed taxonomy. */
+export interface IntentDef {
+  /** Canonical intent id — the ONLY value the classifier may emit for `intent`. */
+  id: string;
+  /** The single path this intent takes. Route is DERIVED from intent, so the
+   *  taxonomy stays the one source of truth: the classifier never chooses a
+   *  route independently of the intent it picked. */
+  route: Route;
+  /** The capability skill tag this intent implies when it delegates to a Blocks
+   *  specialist (create-image → text-to-image, tone-analysis → tone-guide, …).
+   *  Omitted for intents the runtime or gateway handle without a tagged
+   *  specialist (plain chat, calendar/mail actions, catalog discovery). */
+  tag?: CapabilityTag;
+  /** One-line description — the human column that seeds the classifier system
+   *  prompt. Kept here so the prompt is generated FROM the taxonomy and the
+   *  SKILL.md is diffed against it (`check:skill-contract`); it can never drift. */
+  description: string;
+}
+
+export const INTENTS: readonly IntentDef[] = [
+  // ── assistant: the owner acting on their OWN world ──
+  { id: 'coordinate-meeting', route: 'assistant', description: 'Find a mutually-free time / coordinate a meeting with a named peer.' },
+  { id: 'check-availability', route: 'assistant', description: "Answer from the owner's OWN calendar (am I free, what is my availability)." },
+  { id: 'book-event', route: 'assistant', description: 'Create a calendar event the owner has already timed.' },
+  { id: 'draft-email', route: 'assistant', description: "Draft, reply to, or send an email on the owner's behalf." },
+  { id: 'read-email', route: 'assistant', description: "Read or check the owner's inbox." },
+  { id: 'create-image', route: 'assistant', tag: TAGS.textToImage, description: 'Create / generate / draw a NEW image, poster, logo, or art.' },
+  { id: 'describe-image', route: 'assistant', tag: TAGS.imageToText, description: 'Describe / read / caption an EXISTING or attached image.' },
+  { id: 'narrate-text', route: 'assistant', tag: TAGS.textToSpeech, description: 'Narrate / read text aloud / voiceover.' },
+  { id: 'transcribe-audio', route: 'assistant', tag: TAGS.speechToText, description: 'Transcribe a voice clip / audio to text.' },
+  { id: 'identity', route: 'assistant', description: "Answer who-are-you, or the owner's own name, email, or timezone from the profile." },
+  // ── specialist: a deterministic Blocks specialist / catalog lookup ──
+  { id: 'tone-analysis', route: 'specialist', tag: TAGS.toneGuide, description: "Analyze a LinkedIn profile's tone / voice / style." },
+  { id: 'catalog-discovery', route: 'specialist', description: 'Discover WHICH Blocks agents / tools / models can do something.' },
+  { id: 'use-specialist', route: 'specialist', description: 'Use a specific or random Blocks agent the owner picked.' },
+  // ── gateway: ordinary chat OpenClaw answers itself ──
+  { id: 'summarize', route: 'gateway', description: 'Summarize arbitrary text with no Blocks or owner context.' },
+  { id: 'chat', route: 'gateway', description: 'Ordinary conversation, general knowledge, explanations, jokes.' },
+];
+
+const INTENT_BY_ID = new Map<string, IntentDef>(INTENTS.map((i) => [i.id, i]));
+
+/** The closed intent-id set, in canonical (table) order. */
+export const INTENT_IDS: readonly string[] = INTENTS.map((i) => i.id);
+
+/** True when `value` is a canonical intent id. */
+export function isIntentId(value: unknown): value is string {
+  return typeof value === 'string' && INTENT_BY_ID.has(value);
+}
+
+/** The full definition for an intent id, or `undefined`. */
+export function intentDef(id: string): IntentDef | undefined {
+  return INTENT_BY_ID.get(id);
+}
+
+/** The canonical route an intent takes (the taxonomy owns the intent→route map). */
+export function intentRoute(id: string): Route | undefined {
+  return INTENT_BY_ID.get(id)?.route;
+}
+
+/** The canonical capability tag an intent implies, or `undefined`. */
+export function intentTag(id: string): CapabilityTag | undefined {
+  return INTENT_BY_ID.get(id)?.tag;
 }
 
 /**
@@ -164,7 +252,7 @@ export function imageAlreadyRead(text: string): boolean {
 }
 
 /** A delegation brain whose prompt the gateway feeds an LLM. */
-export type GuidanceDoc = 'personal_assistant' | 'blocks_network';
+export type GuidanceDoc = 'personal_assistant' | 'blocks_network' | 'intent_classify';
 
 /**
  * Routing-GUIDANCE invariants — the decision RULES that the tag-set diff
@@ -187,6 +275,6 @@ export const GUIDANCE_INVARIANTS: ReadonlyArray<{
   {
     id: 'image-create-vs-understand',
     phrase: 'Create vs. understand an image',
-    docs: ['personal_assistant', 'blocks_network'],
+    docs: ['personal_assistant', 'blocks_network', 'intent_classify'],
   },
 ];

@@ -932,6 +932,100 @@ button { font-family: inherit; cursor: pointer; }
   color: var(--text-3);
   font-size: 13px;
 }
+
+/* ============== Network agents (browse the full registry) ============= */
+.network-head-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.network-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.network-toggle-btn:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+.network-body { display: flex; flex-direction: column; gap: 10px; padding: 12px 16px 14px; }
+.network-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  padding: 0 10px;
+  color: var(--text-3);
+}
+.network-search:focus-within { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.network-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  padding: 9px 0;
+}
+.network-search-clear {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 6px;
+}
+.network-search-clear:hover { color: var(--text); background: var(--bg-hover); }
+.network-result-line { font-size: 12px; color: var(--text-3); }
+.network-truncated {
+  font-size: 12px;
+  color: var(--text-2);
+  border: 1px solid color-mix(in srgb, #d99a2b 30%, var(--border));
+  background: color-mix(in srgb, #d99a2b 8%, var(--bg-elev));
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.network-pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 2px; }
+.network-page-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.network-page-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+.network-page-btn:disabled { opacity: 0.5; cursor: default; }
+.network-page-info { font-size: 12px; color: var(--text-3); }
+/* Paid agents get an amber price pill so a free-expecting user notices. */
+.catalog-price.paid {
+  color: #d99a2b;
+  border-color: color-mix(in srgb, #d99a2b 34%, var(--border));
+  background: color-mix(in srgb, #d99a2b 10%, var(--bg-elev));
+}
 .overview-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -1725,6 +1819,70 @@ button { font-family: inherit; cursor: pointer; }
 .chip-form-actions .mini-btn { border: 1px solid var(--border-strong); padding: 5px 12px; border-radius: 8px; }
 
 .thinking-error-remedy { color: var(--accent); font-size: 11.5px; margin-top: 2px; }
+
+/* ==================== Meeting-request handshake ======================== */
+.mreq-panel {
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--bg-elev);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.mreq-head { display: flex; flex-direction: column; gap: 2px; }
+.mreq-title { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
+.mreq-sub { font-size: 12px; color: var(--text-3); }
+.mreq-error {
+  font-size: 12.5px; color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-subtle));
+  border-radius: 9px; padding: 8px 11px;
+}
+.mreq-card {
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 11px 13px;
+  background: var(--bg-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mreq-card.actionable {
+  border-color: color-mix(in srgb, var(--accent) 26%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-elev));
+}
+.mreq-card.resolved { opacity: 0.72; flex-direction: row; align-items: center; justify-content: space-between; }
+.mreq-msg { font-size: 13.5px; color: var(--text); line-height: 1.45; }
+.mreq-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mreq-role { font-size: 11.5px; color: var(--text-3); }
+.mreq-badge {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+  padding: 2px 9px; border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-2); background: var(--bg-elev);
+  white-space: nowrap;
+}
+.mreq-badge.status-pending-both { color: #a9701c; border-color: color-mix(in srgb, #d08b2c 40%, var(--border)); background: color-mix(in srgb, #d08b2c 10%, transparent); }
+.mreq-badge.status-both-accepted { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+.mreq-badge.status-committed { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, var(--border)); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.mreq-badge.status-declined, .mreq-badge.status-expired, .mreq-badge.status-commit-failed {
+  color: var(--danger); border-color: color-mix(in srgb, var(--danger) 34%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+.mreq-actions { display: flex; gap: 8px; }
+.mreq-btn {
+  flex: 1; height: 34px; border-radius: 9px; font-size: 13px; font-weight: 600;
+  cursor: pointer; border: 1px solid var(--border-strong); background: var(--bg-elev); color: var(--text);
+  transition: background 0.12s, border-color 0.12s, transform 0.05s;
+}
+.mreq-btn:hover:not(:disabled) { background: var(--bg-hover); }
+.mreq-btn:active:not(:disabled) { transform: translateY(1px); }
+.mreq-btn:disabled { opacity: 0.55; cursor: default; }
+.mreq-btn.accept { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.mreq-btn.accept:hover:not(:disabled) { background: var(--accent-strong); }
+.mreq-btn.decline { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, var(--border)); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.05ms !important; }

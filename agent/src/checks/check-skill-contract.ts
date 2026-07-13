@@ -24,8 +24,15 @@
 import { readFile } from 'node:fs/promises';
 
 import { loadRootEnv } from '../env.ts';
-import { CAPABILITY_TAGS, GUIDANCE_INVARIANTS, type GuidanceDoc } from '../routing/intent-tags.ts';
+import {
+  CAPABILITY_TAGS,
+  GUIDANCE_INVARIANTS,
+  INTENTS,
+  INTENT_IDS,
+  type GuidanceDoc,
+} from '../routing/intent-tags.ts';
 import { validatePlan } from '../assistant/plan-schema.ts';
+import { validateClassification } from '../routing/classify.ts';
 
 loadRootEnv();
 process.env.FOUNDATION_OFFLINE = '1';
@@ -92,8 +99,42 @@ function assertSameSet(actual: string[], expected: readonly string[], label: str
   const extra = [...a].filter((t) => !e.has(t));
   assert(
     missing.length === 0 && extra.length === 0,
-    `${label} tag set drifted from intent-tags.ts — missing ${JSON.stringify(missing)}, extra ${JSON.stringify(extra)}`,
+    `${label} set drifted from intent-tags.ts — missing ${JSON.stringify(missing)}, extra ${JSON.stringify(extra)}`,
   );
+}
+
+/* ── 1c. intent taxonomy drift (intent_classify) ─────────────────────────── */
+
+interface IntentRow {
+  id: string;
+  route: string;
+  tag: string | undefined;
+}
+
+/** Parse the intent | route | tag rows out of the intent_classify taxonomy
+ *  table so the SKILL.md prompt can be diffed against the closed taxonomy in
+ *  `intent-tags.ts` (the model's prompt is generated FROM the code and can
+ *  never silently drift). A dash cell means "no tag". */
+function intentRowsFromTable(section: string[], label: string): IntentRow[] {
+  const rows = section.filter((l) => l.trim().startsWith('|'));
+  assert(rows.length >= 2, `expected a markdown table in ${label}`);
+  const header = tableCells(rows[0]);
+  const idCol = header.findIndex((c) => /intent/iu.test(c));
+  const routeCol = header.findIndex((c) => /route/iu.test(c));
+  const tagCol = header.findIndex((c) => /tag/iu.test(c));
+  assert(idCol >= 0 && routeCol >= 0 && tagCol >= 0, `expected intent/route/tag columns in ${label}, got ${JSON.stringify(header)}`);
+
+  const out: IntentRow[] = [];
+  for (const row of rows.slice(1)) {
+    const cells = tableCells(row);
+    if (cells.length === 0 || cells.every((c) => SEPARATOR.test(c))) continue;
+    const id = (cells[idCol] ?? '').replace(/`/g, '').trim();
+    const route = (cells[routeCol] ?? '').replace(/`/g, '').trim();
+    const rawTag = (cells[tagCol] ?? '').replace(/`/g, '').trim();
+    const tag = !rawTag || rawTag === '—' || rawTag === '-' ? undefined : rawTag;
+    if (id) out.push({ id, route, tag });
+  }
+  return out;
 }
 
 /* ── 2. stale examples ───────────────────────────────────────────────────── */
@@ -188,6 +229,7 @@ function assertRecipientExample(ex: Example): void {
 try {
   const paSkill = await readSkill('workspace/skills/personal_assistant/SKILL.md');
   const bnSkill = await readSkill('workspace/skills/blocks_network/SKILL.md');
+  const icSkill = await readSkill('workspace/skills/intent_classify/SKILL.md');
   const agents = await readSkill('workspace/AGENTS.md');
 
   // 1. intent→tag drift — both DELEGATE FIRST tables must match the module.
@@ -199,10 +241,31 @@ try {
   }
   console.log(`▸ intent→tag: both SKILL.md tables + AGENTS.md match intent-tags.ts (${CAPABILITY_TAGS.length} tags) ✓`);
 
+  // 1c. intent taxonomy drift — the classifier prompt's taxonomy table is the
+  // CLOSED set the model chooses from, so it must match INTENTS exactly (ids,
+  // per-intent route, per-intent tag) and restate each one-line description.
+  const intentRows = intentRowsFromTable(sectionLines(icSkill, 'Intent taxonomy'), 'intent_classify taxonomy');
+  assertSameSet(intentRows.map((r) => r.id), INTENT_IDS, 'intent_classify taxonomy intent-id');
+  const rowById = new Map(intentRows.map((r) => [r.id, r]));
+  for (const def of INTENTS) {
+    const row = rowById.get(def.id);
+    assert(row, `intent "${def.id}" is missing from the intent_classify taxonomy table`);
+    assert(row.route === def.route, `intent "${def.id}" route drifted: table "${row.route}" vs code "${def.route}"`);
+    assert(
+      (row.tag ?? undefined) === (def.tag ?? undefined),
+      `intent "${def.id}" tag drifted: table ${JSON.stringify(row.tag)} vs code ${JSON.stringify(def.tag)}`,
+    );
+    assert(
+      icSkill.includes(def.description),
+      `intent_classify must restate the taxonomy description for "${def.id}": ${def.description}`,
+    );
+  }
+  console.log(`▸ intent taxonomy: intent_classify SKILL.md matches intent-tags.ts (${INTENT_IDS.length} intents, route+tag+description) ✓`);
+
   // 1b. Guidance invariants — routing RULES the tag-set diff can't see. Each
   // brain's prompt is its own LLM context (prose can't be imported), so a rule
   // added to one brain must be mirrored into the others or this fails.
-  const guidanceDoc: Record<GuidanceDoc, string> = { personal_assistant: paSkill, blocks_network: bnSkill };
+  const guidanceDoc: Record<GuidanceDoc, string> = { personal_assistant: paSkill, blocks_network: bnSkill, intent_classify: icSkill };
   for (const inv of GUIDANCE_INVARIANTS) {
     for (const doc of inv.docs) {
       assert(
@@ -230,6 +293,19 @@ try {
   assert(recipientExamples.length >= 3, `expected recipient_extract examples, got ${recipientExamples.length}`);
   for (const ex of recipientExamples) assertRecipientExample(ex);
   console.log(`▸ examples: ${recipientExamples.length} recipient_extract Output examples hold their shape ✓`);
+
+  // intent_classify examples must validate against the SAME validateClassification
+  // the runtime enforces — and must be CANONICAL (no repair needed), so a stale
+  // example that picks a wrong route/tag or a made-up intent fails CI instead of
+  // teaching the live classifier a shape the runtime would reject/repair.
+  const classifyExamples = extractExamples(icSkill);
+  assert(classifyExamples.length >= 6, `expected intent_classify examples, got ${classifyExamples.length}`);
+  for (const ex of classifyExamples) {
+    const validated = validateClassification(ex.output);
+    assert(validated, `intent_classify Output example is out of taxonomy (validateClassification rejected it): ${ex.raw}`);
+    assert(!validated.repaired, `intent_classify Output example needed repair — make it canonical (route/tag pinned by intent): ${ex.raw}`);
+  }
+  console.log(`▸ examples: ${classifyExamples.length} intent_classify Output examples validate against validateClassification ✓`);
 
   console.log('\naudit: one canonical intent→tag map, docs diffed against code, and every SKILL.md example validated against the runtime contract');
   console.log('✅ skill-contract check passed');

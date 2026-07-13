@@ -244,6 +244,81 @@ export async function negotiateSlot(args: NegotiateArgs): Promise<NegotiationRes
   }
 }
 
+/**
+ * The tentative-hold lifecycle promoted out of `negotiateSlot` so the live
+ * two-sided booking path (`meeting-request.ts`) reuses the SAME
+ * hold → confirm → release machinery instead of reimplementing it. All four
+ * exports place/confirm/release owner-local calendar events through each
+ * side's own owner-bound runtime (the owner-only invariant is unchanged).
+ */
+export interface HoldOutcome {
+  ok: boolean;
+  holds: NegotiationHold[];
+  released: NegotiationHold[];
+  error?: string;
+}
+
+/**
+ * Reserve BOTH owners' calendars with a tentative hold for an already-agreed
+ * slot (no negotiation loop). Idempotent per `threadId` because each side's
+ * hold rides the booking-audit idempotency id `${threadId}:${assistant}:…`.
+ * On a partial failure it compensates by releasing whatever it placed.
+ */
+export async function placeAgreedHolds(
+  booking: NegotiationBooking,
+  slot: string,
+  threadId: string,
+): Promise<HoldOutcome> {
+  const step = await ensureHolds(booking, [], undefined, slot, threadId);
+  return step.failed
+    ? { ok: false, holds: step.holds, released: step.released, error: step.error }
+    : { ok: true, holds: step.holds, released: step.released };
+}
+
+/** Promote each tentative hold to busy (owner-local). Compensates by
+ *  releasing all holds if any side's confirm throws. */
+export async function confirmAgreedHolds(
+  booking: NegotiationBooking,
+  holds: NegotiationHold[],
+  slot: string,
+): Promise<HoldOutcome> {
+  const step = await confirmHolds(booking, holds, slot);
+  return step.failed
+    ? { ok: false, holds: step.holds, released: step.released, error: step.error }
+    : { ok: true, holds: step.holds, released: step.released };
+}
+
+/** Release (delete) owner-local holds on both sides — used on decline and on
+ *  hold-TTL expiry so an unaccepted request never leaves a dangling hold. */
+export async function releaseAgreedHolds(
+  booking: NegotiationBooking,
+  holds: NegotiationHold[],
+): Promise<NegotiationHold[]> {
+  return releaseHolds(booking, holds);
+}
+
+/**
+ * One-shot bilateral commit for an already-agreed slot: place tentative holds
+ * on both calendars, then confirm both to busy. Any failure compensates
+ * (releases both holds) and reports `booking-failed`. This is the production
+ * commit the `MeetingRequest` state machine drives once BOTH owners accept.
+ */
+export async function commitAgreedSlot(
+  booking: NegotiationBooking,
+  slot: string,
+  threadId: string,
+): Promise<NegotiationBookingOutcome> {
+  const placed = await placeAgreedHolds(booking, slot, threadId);
+  if (!placed.ok) {
+    return { outcome: 'booking-failed', slot, holds: placed.holds, released: placed.released, error: placed.error };
+  }
+  const confirmed = await confirmAgreedHolds(booking, placed.holds, slot);
+  if (!confirmed.ok) {
+    return { outcome: 'booking-failed', slot, holds: confirmed.holds, released: confirmed.released, error: confirmed.error };
+  }
+  return { outcome: 'booked', slot, holds: placed.holds, released: [] };
+}
+
 type HoldStep =
   | { failed: false; holds: NegotiationHold[]; released: NegotiationHold[] }
   | { failed: true; holds: NegotiationHold[]; released: NegotiationHold[]; error: string };

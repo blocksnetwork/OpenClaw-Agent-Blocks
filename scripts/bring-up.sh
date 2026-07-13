@@ -33,6 +33,20 @@ systemctl_cmd() {
   fi
 }
 
+# Kept in sync with scripts/serve-agents.sh RETIRED_AGENTS. Agents present under
+# agent/published/ that must NOT be served by default (probe + retired
+# capability-bank agents). Override with RETIRED_AGENTS="a,b,c".
+RETIRED_AGENTS="${RETIRED_AGENTS:-pa_test_private,openclaw_poster_maker,openclaw_narrator,openclaw_headliner}"
+
+is_retired() {
+  local candidate="$1" item
+  local IFS=','
+  for item in $RETIRED_AGENTS; do
+    [[ "$item" == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
 agent_list() {
   if [[ -n "${SERVE_AGENTS:-}" ]]; then
     printf '%s\n' "$SERVE_AGENTS" | tr ',[:space:]' '\n' | sed '/^$/d'
@@ -43,7 +57,7 @@ agent_list() {
   for card in agent/published/*/agent-card.json; do
     [[ -f "$card" ]] || continue
     dir="$(basename "$(dirname "$card")")"
-    [[ "$dir" == "pa_test_private" ]] && continue
+    is_retired "$dir" && continue
     case "$dir" in
       openclaw_*|pa_*) printf '%s\n' "$dir" ;;
     esac

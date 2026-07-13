@@ -93,6 +93,26 @@ case "$cmd" in
     # echo '{"image":"<base64>","format":"png","prompt":"..."}' | blocks describe-json
     post /api/describe-image "$(cat)"
     ;;
+  generate)
+    # Create an image: hire a text-to-image agent on Blocks from a text
+    # prompt and get back the rendered picture. Selection is tag-discovery +
+    # ranking (no hardcoded handle); defaults to free so a paid image agent
+    # is never hired silently. Optional --strategy coordinates MULTIPLE image
+    # agents when more than one is discovered:
+    #   single (default) | race | compare | best
+    strategy="single"
+    if [ "$1" = "--strategy" ] || [ "$1" = "-s" ]; then
+      strategy="${2:?usage: blocks generate [--strategy single|race|compare|best] <prompt...>}"
+      shift 2
+    fi
+    prompt="${*:?usage: blocks generate [--strategy single|race|compare|best] <prompt...>}"
+    text="$(json_escape "$prompt")"
+    post /api/generate-image "{\"prompt\":\"$text\",\"billingMode\":\"free\",\"strategy\":\"$strategy\"}"
+    ;;
+  generate-json)
+    # echo '{"prompt":"a lighthouse at dawn","billingMode":"free"}' | blocks generate-json
+    post /api/generate-image "$(cat)"
+    ;;
   call-json)
     # echo '{"handle":"...","skill":"...","inputs":{...}}' | blocks call-json
     post /api/call-agent "$(cat)"
@@ -126,7 +146,7 @@ case "$cmd" in
     curl -sf -m 30 "$BASE/api/assistant/peers?agentName=$name"
     ;;
   *)
-    echo "usage: blocks status | discover <tag> | search <catalog-query...> | call <handle> <tag> <text...> | fanout <tag> <text...> | race <tag> <text...> | best <tag> <text...> | describe <image-file> [prompt...] | describe-json | call-json | fanout-json | served | serve <dir> | stop <agentName> | assistant.invite <self-agent> <self-owner> <peer-agent> <peer-owner> | assistant.peers <agentName>" >&2
+    echo "usage: blocks status | discover <tag> | search <catalog-query...> | call <handle> <tag> <text...> | fanout <tag> <text...> | race <tag> <text...> | best <tag> <text...> | describe <image-file> [prompt...] | describe-json | generate [--strategy single|race|compare|best] <prompt...> | generate-json | call-json | fanout-json | served | serve <dir> | stop <agentName> | assistant.invite <self-agent> <self-owner> <peer-agent> <peer-owner> | assistant.peers <agentName>" >&2
     exit 2
     ;;
 esac
