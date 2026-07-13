@@ -1365,6 +1365,10 @@
     const deployedBaseUrl = ((window.OPENCLAW_CONFIG && window.OPENCLAW_CONFIG.baseUrl) || "").trim();
     const usingDeployedBridge = (s.baseUrl || "").trim().replace(/\/+$/, "") === deployedBaseUrl.replace(/\/+$/, "");
     const useDeployedBridge = () => set("baseUrl", deployedBaseUrl);
+    // The deployment's default bridge is applied behind the scenes: when the
+    // effective base URL is that default, keep the field blank (don't surface the
+    // URL) — it still routes there and stays fully overridable if you type one.
+    const hideBaseUrl = !!deployedBaseUrl && usingDeployedBridge;
 
     // Pillar 0: owner identity profile + contact book. Loaded from the
     // bridge when an Owner ID is set; edited inline and persisted on Save
@@ -1462,14 +1466,21 @@
           <div className="modal-body">
             <div className="field">
               <label>Gateway base URL</label>
-              <input type="text" value={s.baseUrl}
-                onChange={(e) => set("baseUrl", e.target.value)} placeholder="(blank = via foundation bridge)" />
-              <span className="hint">Current deployment bridge: <code style={{ fontFamily: "var(--mono)" }}>{deployedBaseUrl || "same origin"}</code></span>
-              <div className="inline-actions">
-                <button className="btn secondary" type="button" onClick={useDeployedBridge} disabled={usingDeployedBridge}>
-                  Use deployed bridge
-                </button>
-              </div>
+              <input type="text" value={hideBaseUrl ? "" : s.baseUrl}
+                onChange={(e) => set("baseUrl", e.target.value)}
+                placeholder={hideBaseUrl ? "Using the demo bridge (leave blank)" : "(blank = via foundation bridge)"} />
+              <span className="hint">
+                {hideBaseUrl
+                  ? "Connected to the demo bridge behind the scenes. Type a URL to override."
+                  : <>Current deployment bridge: <code style={{ fontFamily: "var(--mono)" }}>{deployedBaseUrl || "same origin"}</code></>}
+              </span>
+              {hideBaseUrl ? null : (
+                <div className="inline-actions">
+                  <button className="btn secondary" type="button" onClick={useDeployedBridge} disabled={usingDeployedBridge}>
+                    Use deployed bridge
+                  </button>
+                </div>
+              )}
               <span className="hint">This controls where assistant, Google, and peer calls go. Use the deployed bridge for the EC2 demo.</span>
             </div>
             <div className="field">
