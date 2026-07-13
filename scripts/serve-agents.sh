@@ -36,12 +36,15 @@ is_agent_name() {
 
 # Agents that live under agent/published/ but must NOT be served by default.
 #   pa_test_private            — findability/check probe only
-#   openclaw_poster_maker      — retired capability-bank agent (text-to-image)
-#   openclaw_narrator          — retired capability-bank agent (text-to-speech)
 #   openclaw_headliner         — retired capability-bank agent (headline-write)
-# These can still be served on demand by passing the name explicitly or via
-# SERVE_AGENTS=. Override the retired set with RETIRED_AGENTS="a,b,c".
-RETIRED_AGENTS="${RETIRED_AGENTS:-pa_test_private,openclaw_poster_maker,openclaw_narrator,openclaw_headliner}"
+# openclaw_poster_maker (text-to-image) and openclaw_narrator (text-to-speech)
+# are served by default: they are the media-generation agents /api/generate-image
+# and blocks_network/SKILL.md discover, so image/audio creation must have a live
+# instance to hire (otherwise the hire times out and the turn falls back to the
+# gateway). Retired agents can still be served on demand by passing the name
+# explicitly or via SERVE_AGENTS=. Override the retired set with
+# RETIRED_AGENTS="a,b,c".
+RETIRED_AGENTS="${RETIRED_AGENTS:-pa_test_private,openclaw_headliner}"
 
 is_retired() {
   local candidate="$1" item

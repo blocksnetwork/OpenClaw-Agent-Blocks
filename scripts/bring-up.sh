@@ -35,8 +35,10 @@ systemctl_cmd() {
 
 # Kept in sync with scripts/serve-agents.sh RETIRED_AGENTS. Agents present under
 # agent/published/ that must NOT be served by default (probe + retired
-# capability-bank agents). Override with RETIRED_AGENTS="a,b,c".
-RETIRED_AGENTS="${RETIRED_AGENTS:-pa_test_private,openclaw_poster_maker,openclaw_narrator,openclaw_headliner}"
+# capability-bank agents). openclaw_poster_maker (text-to-image) and
+# openclaw_narrator (text-to-speech) are served by default so image/audio
+# creation has a live agent to hire. Override with RETIRED_AGENTS="a,b,c".
+RETIRED_AGENTS="${RETIRED_AGENTS:-pa_test_private,openclaw_headliner}"
 
 is_retired() {
   local candidate="$1" item
