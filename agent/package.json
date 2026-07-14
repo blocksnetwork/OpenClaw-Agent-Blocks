@@ -77,7 +77,7 @@
     "node": ">=22"
   },
   "devDependencies": {
-    "@blocks-network/cli": "^0.1.67",
+    "@blocks-network/cli": "^1.0.10",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
   },
