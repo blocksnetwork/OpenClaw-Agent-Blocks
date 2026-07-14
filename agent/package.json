@@ -82,7 +82,7 @@
     "typescript": "^5.6.0"
   },
   "dependencies": {
-    "@blocks-network/sdk": "^0.1.67",
+    "@blocks-network/sdk": "^1.0.8",
     "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }
